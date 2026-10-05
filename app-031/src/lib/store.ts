@@ -1,18 +1,30 @@
 // 全局状态：Vue reactive 单例 + localStorage 持久化（无 Pinia/Vuex）
 import { reactive, computed } from 'vue'
-import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
+import type {
+  Board,
+  IssuedRequisition,
+  Job,
+  NestResult,
+  Part,
+  RegisteredOffcut,
+  SheetResult
+} from '../types'
 import { nestJob } from './packing'
+import { selectBoards, type SelectOutcome } from './selector'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
 import { uid } from './format'
 import boardsData from '../data/boards.json'
 
-const JOBS_KEY = 'fco.jobs.v1'
+const JOBS_KEY = 'fco.jobs.v2'
+const LEGACY_JOBS_KEY = 'fco.jobs.v1'
 const OFFCUTS_KEY = 'fco.offcuts.v1'
+const REQUISITIONS_KEY = 'fco.requisitions.v1'
 
 interface State {
   jobs: Job[]
   offcuts: RegisteredOffcut[]
+  requisitions: IssuedRequisition[]
   loaded: boolean
 }
 
@@ -31,18 +43,60 @@ function load<T>(key: string, fallback: T): T {
 const state = reactive<State>({
   jobs: [],
   offcuts: [],
+  requisitions: [],
   loaded: false
 })
 
 function persist(): void {
   localStorage.setItem(JOBS_KEY, JSON.stringify(state.jobs))
   localStorage.setItem(OFFCUTS_KEY, JSON.stringify(state.offcuts))
+  localStorage.setItem(REQUISITIONS_KEY, JSON.stringify(state.requisitions))
+}
+
+/** 旧存档迁移 + 新字段补齐：预算/策略/版次、result.materialLines、selection。 */
+function migrateJob(j: Job): void {
+  if (j.budgetCents === undefined) j.budgetCents = 0
+  if (!j.strategy) j.strategy = 'cheapest'
+  if (j.selectionRevision === undefined) j.selectionRevision = 0
+  if (j.result) {
+    if (!j.result.materialLines) {
+      // 从 sheets 反建同源领料行（旧版只有 boardsByType）
+      const map = new Map<string, NestResult['materialLines'][number]>()
+      for (const s of j.result.sheets) {
+        let line = map.get(s.boardId)
+        if (!line) {
+          line = {
+            boardId: s.boardId,
+            boardName: s.boardName,
+            material: s.material,
+            thicknessMm: s.thicknessMm,
+            wMm: s.wMm,
+            hMm: s.hMm,
+            priceCents: s.priceCents,
+            sheets: 0,
+            subtotalCents: 0
+          }
+          map.set(s.boardId, line)
+        }
+        line.sheets++
+        line.subtotalCents += s.priceCents
+      }
+      j.result.materialLines = [...map.values()]
+    }
+  }
 }
 
 function init(): void {
   if (state.loaded) return
-  state.jobs = load<Job[]>(JOBS_KEY, [])
+  let jobs = load<Job[]>(JOBS_KEY, [])
+  if (jobs.length === 0) {
+    const legacy = load<Job[] | null>(LEGACY_JOBS_KEY, null)
+    if (legacy && Array.isArray(legacy)) jobs = legacy
+  }
+  jobs.forEach(migrateJob)
+  state.jobs = jobs
   state.offcuts = load<RegisteredOffcut[]>(OFFCUTS_KEY, [])
+  state.requisitions = load<IssuedRequisition[]>(REQUISITIONS_KEY, [])
   state.loaded = true
 }
 
@@ -83,8 +137,11 @@ export function createJob(name: string): Job {
     parts: [],
     kerfMm: boardsData.defaults.kerfMm,
     trimMm: boardsData.defaults.trimMm,
+    budgetCents: 0,
+    strategy: 'cheapest',
     useOffcutIds: [],
-    batchByCabinet: false
+    batchByCabinet: false,
+    selectionRevision: 0
   }
   state.jobs.unshift(job)
   persist()
@@ -105,6 +162,7 @@ export function duplicateJob(id: string): Job | null {
   job.name = `${src.name} 副本`
   job.createdAt = Date.now()
   job.result = undefined
+  job.selectionRevision = 0
   state.jobs.unshift(job)
   persist()
   return job
@@ -140,7 +198,7 @@ function boardsWithOffcuts(job: Job): Board[] {
 
 export function runNest(job: Job): NestResult {
   const effective: Job = { ...job, boards: boardsWithOffcuts(job) }
-  const result = nestJob(effective)
+  const result = nestJob(effective, {})
   // 标记被用掉的余料
   const usedOffcutBoardIds = new Set(
     result.sheets.filter((s) => s.boardId.startsWith('offcut_')).map((s) => s.boardId)
@@ -154,6 +212,81 @@ export function runNest(job: Job): NestResult {
   job.result = result
   persist()
   return result
+}
+
+/**
+ * 选板与花费反算（正式入口）：
+ * - 枚举板种走同一个排样内核；结论（板种/张数/每张摆法/摊到每张板的钱）写进 job.result，
+ *   板件明细页、排样结果页、材料统计页、领料单全部消费这同一份。
+ * - 输入变化（锯路/修边/板价/板幅/零件/余料勾选）重算时带上一版做 diff；
+ *   结论变化导致版次 +1，并把已签发的旧领料单作废。
+ * - 零零件 / 预算为 0 / 排不下：不产生正式结论（见 SelectionState.status）。
+ */
+export function runSelection(job: Job): SelectOutcome {
+  const effective: Job = { ...job, boards: boardsWithOffcuts(job) }
+  const prev =
+    job.result?.selection && job.result.selection.prevSnapshot
+      ? { result: job.result, snapshot: job.result.selection.prevSnapshot, revision: job.selectionRevision || 0 }
+      : null
+  const outcome = selectBoards(effective, effective.boards, prev)
+
+  if (outcome.result) job.result = outcome.result
+  const sel = outcome.selection
+  if (sel.status === 'conclusion' || sel.status === 'budget') {
+    const rev = sel.revision
+    if (prev && rev > prev.revision) {
+      const changes = sel.lastDiff?.paramChanges ?? []
+      for (const r of state.requisitions) {
+        if (!r.voided && r.jobId === job.id && r.revision < rev) {
+          r.voided = true
+          r.voidedAt = Date.now()
+          r.voidReason =
+            `选板输入变化并重算（${changes.slice(0, 3).join('；')}${changes.length > 3 ? ' 等' : ''}），` +
+            `旧领料行已被第 ${rev} 版选板结论替代`
+        }
+      }
+    }
+    job.selectionRevision = rev
+  }
+  persist()
+  return outcome
+}
+
+/** 输入变化后的自动重算：已有结果（含失败诊断）时即时刷新；从未排样时不打扰录单。 */
+export function autoReselect(job: Job): SelectOutcome | null {
+  if (!job.result) return null
+  return runSelection(job)
+}
+
+/** 签发领料单据（本机存档）：记录版次；之后选板结论一变，旧单自动作废。 */
+export function issueRequisition(job: Job): IssuedRequisition | null {
+  const r = job.result
+  if (!r || r.selection?.status !== 'conclusion') return null
+  const rec: IssuedRequisition = {
+    id: uid('req'),
+    jobId: job.id,
+    jobName: job.name,
+    revision: r.selection.revision,
+    issuedAt: Date.now(),
+    strategy: r.selection.strategy,
+    budgetCents: r.selection.budgetCents,
+    lines: JSON.parse(JSON.stringify(r.materialLines)),
+    totalCostCents: r.totalCostCents,
+    totalSheets: r.boardsUsed,
+    voided: false
+  }
+  state.requisitions.push(rec)
+  persist()
+  return rec
+}
+
+export function requisitionsForJob(jobId: string): IssuedRequisition[] {
+  init()
+  return state.requisitions.filter((r) => r.jobId === jobId).sort((a, b) => b.issuedAt - a.issuedAt)
+}
+
+export function latestValidRequisition(jobId: string): IssuedRequisition | undefined {
+  return requisitionsForJob(jobId).find((r) => !r.voided)
 }
 
 /** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
@@ -271,6 +404,9 @@ export function toggleOffcut(id: string): void {
 /** 示例：一套橱柜 + 衣柜混合 BOM（含竖纹门板、见光侧板、背板 9mm） */
 export function createSampleJob(): Job {
   const job = createJob('示例：三室全屋柜体（18mm 柜体 + 9mm 背板）')
+  // 示例预算：18mm 柜体板若干 + 9mm 背板，给一个略有余量的上限（分）
+  job.budgetCents = 200000
+  job.strategy = 'cheapest'
   const b18 = job.boards[0] // 颗粒板 18mm
   const bBack = boardsData.stockBoards[6]
   const back: Board = {
@@ -352,7 +488,8 @@ export function newPart(partial: Partial<Part> = {}): Part {
     edgeBands: partial.edgeBands ?? [],
     cabinet: partial.cabinet ?? '未分组',
     exposed: partial.exposed ?? false,
-    boardId: partial.boardId ?? ''
+    boardId: partial.boardId ?? '',
+    thicknessMm: partial.thicknessMm ?? 0
   }
 }
 
@@ -367,6 +504,8 @@ export function importJobJson(json: string): Job | null {
     obj.id = uid('job')
     obj.createdAt = Date.now()
     obj.result = undefined
+    obj.selectionRevision = 0
+    migrateJob(obj)
     state.jobs.unshift(obj)
     persist()
     return obj

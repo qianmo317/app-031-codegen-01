@@ -50,8 +50,8 @@ const cabinetGroups = computed(() => {
 const grainText = (g: string): string =>
   g === 'length' ? '竖纹' : g === 'width' ? '横纹' : '无要求'
 
-const boardByName = (name: string) =>
-  job.value?.result?.sheets.find((x) => x.boardName === name)
+const sel = computed(() => job.value?.result?.selection)
+const isConclusion = computed(() => sel.value?.status === 'conclusion')
 </script>
 
 <template>
@@ -67,6 +67,7 @@ const boardByName = (name: string) =>
         <p class="doc-meta">
           {{ s.boardName }}（{{ s.material }} {{ s.thicknessMm }}mm） · 尺寸
           {{ s.wMm }}×{{ s.hMm }}mm · 利用率 {{ (s.utilization * 100).toFixed(1) }}% ·
+          本张摊 {{ money(s.priceCents) }} ·
           锯路 {{ job.kerfMm }}mm · 修边 {{ job.trimMm }}mm
         </p>
         <div class="print-sheet-wrap">
@@ -126,26 +127,36 @@ const boardByName = (name: string) =>
     <div v-if="sections.has('order')">
       <section class="print-page">
         <h2>下料单 / 领料单</h2>
-        <p class="doc-meta">项目：{{ job.name }} ｜ 打印时间：{{ now }}</p>
+        <p class="doc-meta">
+          项目：{{ job.name }} ｜ 打印时间：{{ now }}
+          <template v-if="sel">
+            ｜ 选板第 {{ sel.revision }} 版（{{ sel.strategy === 'cheapest' ? '先挑最省' : '先挑最大板幅' }}）
+            ｜ 预算 {{ money(sel.budgetCents) }}
+          </template>
+        </p>
+        <p v-if="sel && !isConclusion" style="color:#b00; font-weight:700;">
+          本单当前不是正式选板结论（{{ sel.status === 'budget' ? '预算不够，未签发' : sel.status === 'blocked' ? (sel.blockKind === 'grain' ? '纹理卡死' : '板幅不够') : '前置条件不足' }}），
+          领料数字不得作为采购依据。
+        </p>
 
-        <h3>一、板材领料</h3>
+        <h3>一、板材领料（与板件明细页、排样结果页、材料统计页同源）</h3>
         <table class="pgrid">
           <thead>
             <tr><th>板材</th><th>规格(mm)</th><th>厚度</th><th>张数</th><th>单价</th><th>小计</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(n, name) in job.result?.boardsByType" :key="name">
-              <td>{{ name }}</td>
-              <td>{{ boardByName(String(name))?.wMm }}×{{ boardByName(String(name))?.hMm }}</td>
-              <td>{{ boardByName(String(name))?.thicknessMm }}</td>
-              <td>{{ n }}</td>
-              <td>{{ money(boardByName(String(name))?.priceCents ?? 0) }}</td>
-              <td>{{ money((boardByName(String(name))?.priceCents ?? 0) * Number(n)) }}</td>
+            <tr v-for="line in job.result?.materialLines ?? []" :key="line.boardId">
+              <td>{{ line.boardName }}</td>
+              <td>{{ line.wMm }}×{{ line.hMm }}</td>
+              <td>{{ line.thicknessMm }}</td>
+              <td>{{ line.sheets }}</td>
+              <td>{{ money(line.priceCents) }}</td>
+              <td>{{ money(line.subtotalCents) }}</td>
             </tr>
           </tbody>
           <tfoot>
             <tr>
-              <td colspan="5">板材合计</td>
+              <td colspan="5">板材合计（金额按分计、折元四舍五入到 0.01 元）</td>
               <td>{{ money(job.result?.totalCostCents ?? 0) }}</td>
             </tr>
           </tfoot>

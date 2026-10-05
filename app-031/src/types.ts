@@ -28,6 +28,7 @@ export interface Part {
   cabinet: string // 所在柜体/房间，便于分拣
   exposed: boolean // 是否见光
   boardId?: string // 指定板材类型，空 = 自动
+  thicknessMm?: number // 指定厚度（mm），0/空 = 不限；只允许排上同厚度的板
 }
 
 export interface Placement {
@@ -97,10 +98,91 @@ export interface UnplacedInfo {
   reason: string
 }
 
+// ── 选板与花费反算 ────────────────────────────────────────────────
+// 二选一策略：先挑最省（总价优先）/ 先挑最大板幅（张数优先）
+export type SelectStrategy = 'cheapest' | 'largest'
+// 选板失败/不出结论的分型
+export type SelectBlockKind = 'grain' | 'size' | 'budget' | 'empty' | 'zero-budget'
+
+/** 领料/成本的唯一行结构（板件明细页、排样结果页、材料统计页、打印领料单全部消费它） */
+export interface MaterialLine {
+  boardId: string
+  boardName: string
+  material: string
+  thicknessMm: number
+  wMm: number
+  hMm: number
+  priceCents: number // 单价（分）
+  sheets: number // 张数
+  subtotalCents: number // 小计（分）= 单价 × 张数
+}
+
+export interface BlockedItem {
+  partId: string
+  code: string
+  name: string
+  qty: number
+  kind: SelectBlockKind
+  reason: string
+}
+
+/** 选板输入快照：用于判断「改一次锯路/修边/板价」到底变了什么 */
+export interface SelectInputSnapshot {
+  kerfMm: number
+  trimMm: number
+  budgetCents: number
+  strategy: SelectStrategy
+  boards: { id: string; name: string; wMm: number; hMm: number; thicknessMm: number; priceCents: number }[]
+  parts: { id: string; lenMm: number; widMm: number; qty: number; grain: GrainDemand; boardId?: string; thicknessMm?: number }[]
+  useOffcutIds: string[]
+  batchByCabinet: boolean
+}
+
+/** 与上一版选板结论相比的逐条变化清单 */
+export interface SelectionDiff {
+  paramChanges: string[]
+  /** 板种或张数变了的行（含新增/删除） */
+  boardLines: { boardName: string; before: number | null; after: number | null; priceChanged?: boolean }[]
+  /** 换了板的零件（实例号 + 件名） */
+  movedParts: { instanceId: string; code: string; name: string; fromBoard: string; toBoard: string }[]
+  /** 每张板（按新序号）的摆法是否重算 */
+  sheetsChanged: { index: number; boardName: string; changed: boolean }[]
+  /** 领料单据 / 成本表上变化的行 */
+  costRows: { boardName: string; beforeSubtotalCents: number | null; afterSubtotalCents: number | null }[]
+  costDeltaCents: number
+  boardKindCountBefore: number
+  boardKindCountAfter: number
+  revisionBump: boolean
+}
+
+export interface SelectionState {
+  budgetCents: number
+  strategy: SelectStrategy
+  revision: number // 结论版次：输入变化导致结论变化时 +1
+  status: 'conclusion' | 'budget' | 'blocked' | 'inconclusive'
+  // 出结论时
+  totalCostCents?: number
+  totalSheets?: number
+  boardKindCount?: number
+  alternate?: { strategy: SelectStrategy; totalCostCents: number; totalSheets: number; boardKindCount: number }
+  // 预算不够 / 板幅不够 / 纹理卡死
+  blockKind?: SelectBlockKind
+  blockedItems?: BlockedItem[]
+  cheapestCostCents?: number // 不卡预算时最省方案的钱
+  budgetShortCents?: number // 距预算还差多少分
+  budgetShortSheets?: number // 折合还差几张「最便宜的可用板」
+  message: string
+  candidatesTried?: number
+  generatedAt: number
+  lastDiff?: SelectionDiff
+  prevSnapshot?: SelectInputSnapshot
+}
+
 export interface NestResult {
   sheets: SheetResult[]
   boardsUsed: number
-  boardsByType: Record<string, number>
+  boardsByType: Record<string, number> // 兼容旧字段；新代码一律消费 materialLines
+  materialLines: MaterialLine[] // 三处同源的唯一领料/成本行
   edgeBandM: { exposed: number; normal: number }
   unplaced: UnplacedInfo[]
   baselineBoards: number // 随手排（朴素顺板）需要的张数
@@ -110,6 +192,23 @@ export interface NestResult {
   stockShortage: { boardId: string; boardName: string; need: number; have: number }[]
   elapsedMs: number
   generatedAt: number
+  selection?: SelectionState
+}
+
+export interface IssuedRequisition {
+  id: string
+  jobId: string
+  jobName: string
+  revision: number
+  issuedAt: number
+  strategy: SelectStrategy
+  budgetCents: number
+  lines: MaterialLine[]
+  totalCostCents: number
+  totalSheets: number
+  voided: boolean
+  voidedAt?: number
+  voidReason?: string
 }
 
 export interface Job {
@@ -120,8 +219,11 @@ export interface Job {
   parts: Part[]
   kerfMm: number
   trimMm: number
+  budgetCents: number // 板材花费上限（分）；0 = 未设定，选板不给结论
+  strategy: SelectStrategy // 选板取舍，二选一（默认先挑最省）
   useOffcutIds: string[] // 参与本单排样的登记余料
   batchByCabinet: boolean // 按柜体批次分组开料
+  selectionRevision: number // 当前选板结论版次（与 result.selection.revision 一致）
   result?: NestResult
 }
 

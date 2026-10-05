@@ -2,19 +2,38 @@
 // - 纹理 length/width 硬约束：只允许指定朝向，rotated 恒为 false，放不下就报原因
 // - 锯路 kerf：零件与零件、零件与余料之间留锯缝；修边 trim 为四周先切掉的边
 // - 利用率分母为整板面积，分子为零件净面积（不含锯路）
+// - 选板枚举与本内核共用 packing-core.ts 的匹配/朝向/余隙/分型判定，禁止另起一套
 import type {
   Board,
   Job,
+  MaterialLine,
   NestResult,
   OffcutInfo,
   Part,
   Placement,
   SheetResult,
+  SelectStrategy,
   UnplacedInfo
 } from '../types'
 import { EPS, type Rect } from './geometry'
 import { buildSteps, simulate } from './cuts'
 import type { DSeg } from './cuts'
+import {
+  blockKind,
+  boardMatchesPart,
+  fitsClean as fitsCleanShared,
+  normalizeBoard,
+  orientsOf,
+  type Orient
+} from './packing-core'
+
+export interface NestOptions {
+  /** 只允许在这些板（id）里开板；不传 = job.boards 全部（选板枚举用） */
+  restrictBoardIds?: string[]
+  /** 新开常规板时的偏好：cheapest 单价最低优先（先挑最省），largest 板幅最大优先（先挑板幅）；
+   *  不传保持历史行为（幅面最小优先，尽量省大板） */
+  preference?: SelectStrategy | 'compact'
+}
 
 interface Inst {
   part: Part
@@ -52,28 +71,19 @@ interface SheetState {
 }
 
 function boardMatches(b: Board, p: Part): boolean {
-  if (!p.boardId) return true
-  if (b.id === p.boardId) return true
-  if (b.kind === 'offcut') {
-    const target = boardDefs.get(p.boardId)
-    return !!target && target.thicknessMm === b.thicknessMm
-  }
-  return false
+  return boardMatchesPart(b, p, boardDefs)
 }
 
 const boardDefs = new Map<string, Board>()
 
-/** 统一为横向板（长边沿 x）。余料上台可以转，所以归一化安全。 */
-function normalize(b: Board): Board {
-  if (b.wMm >= b.hMm) return b
-  return { ...b, wMm: b.hMm, hMm: b.wMm }
-}
-
-export function nestJob(job: Job): NestResult {
+export function nestJob(job: Job, opts: NestOptions = {}): NestResult {
   const t0 = performance.now()
   boardDefs.clear()
-  const boards = job.boards.map(normalize)
-  boards.forEach((b) => boardDefs.set(b.id, b))
+  const allBoards = job.boards.map(normalizeBoard)
+  allBoards.forEach((b) => boardDefs.set(b.id, b))
+  const restrict = opts.restrictBoardIds ? new Set(opts.restrictBoardIds) : null
+  const boards = restrict ? allBoards.filter((b) => restrict.has(b.id)) : allBoards
+  const preference = opts.preference ?? 'compact'
   const kerf = job.kerfMm
   const trim = job.trimMm
 
@@ -141,36 +151,34 @@ export function nestJob(job: Job): NestResult {
       (b) =>
         canOpen(b) &&
         boardMatches(b, p) &&
-        fitsClean(b.wMm - 2 * trim, pw) &&
-        fitsClean(b.hMm - 2 * trim, ph)
+        fitsCleanShared(b.wMm - 2 * trim, pw, kerf) &&
+        fitsCleanShared(b.hMm - 2 * trim, ph, kerf)
     )
-    // 余料小板优先，其次选面积最小的（省大板）
-    viable.sort((a, b) => {
-      if ((a.kind === 'offcut') !== (b.kind === 'offcut')) return a.kind === 'offcut' ? -1 : 1
+    // 余料小板永远最先（零成本、消耗库存）；常规板按选板偏好：
+    // - compact（历史行为）：幅面最小优先，尽量省大板
+    // - cheapest（先挑最省）：单价最低优先，同价比张数效率
+    // - largest（先挑最大板幅）：面积最大优先，同面积比便宜
+    const cmp = (a: Board, b: Board): number => {
+      const offA = a.kind === 'offcut'
+      const offB = b.kind === 'offcut'
+      if (offA !== offB) return offA ? -1 : 1
+      if (preference === 'cheapest') {
+        if (a.priceCents !== b.priceCents) return a.priceCents - b.priceCents
+        return a.wMm * a.hMm - b.wMm * b.hMm
+      }
+      if (preference === 'largest') {
+        const da = a.wMm * a.hMm - b.wMm * b.hMm
+        if (da !== 0) return -da
+        return a.priceCents - b.priceCents
+      }
       return a.wMm * a.hMm - b.wMm * b.hMm
-    })
+    }
+    viable.sort(cmp)
     return viable[0] ?? null
   }
 
-  interface Orient {
-    pw: number
-    ph: number
-    rotated: boolean
-  }
-  // 只允许严丝合缝（0）或余隙 ≥ 锯路；0<余隙<锯路 时下不了刀，禁止放入
-  const fitsClean = (avail: number, size: number): boolean => {
-    const gap = avail - size
-    return gap >= -EPS && (gap <= EPS || gap >= kerf - EPS)
-  }
-  const orientsOf = (p: Part): Orient[] => {
-    if (p.grain === 'length') return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
-    if (p.grain === 'width') return [{ pw: p.widMm, ph: p.lenMm, rotated: false }]
-    if (p.lenMm === p.widMm) return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
-    return [
-      { pw: p.lenMm, ph: p.widMm, rotated: false },
-      { pw: p.widMm, ph: p.lenMm, rotated: true }
-    ]
-  }
+  // 只允许严丝合缝（0）或余隙 ≥ 锯路；0<余隙<锯路 时下不了刀，禁止放入（走共享判定）
+  const fitsClean = (avail: number, size: number): boolean => fitsCleanShared(avail, size, kerf)
 
   const unplaced = new Map<string, { part: Part; qty: number }>()
   const markUnplaced = (p: Part): void => {
@@ -338,12 +346,33 @@ export function nestJob(job: Job): NestResult {
   // 组装 SheetResult
   const results: SheetResult[] = sheets.map((s) => buildSheet(s, kerf, trim))
 
-  // 统计
+  // 统计：materialLines 是三处（板件明细/排样结果/材料统计）与领料单的唯一取数源
+  const materialLines: MaterialLine[] = []
+  const lineIndex = new Map<string, number>()
   const boardsByType: Record<string, number> = {}
   let totalCost = 0
   for (const s of results) {
-    boardsByType[s.boardName] = (boardsByType[s.boardName] ?? 0) + 1
+    let li = lineIndex.get(s.boardId)
+    if (li === undefined) {
+      li = materialLines.length
+      lineIndex.set(s.boardId, li)
+      materialLines.push({
+        boardId: s.boardId,
+        boardName: s.boardName,
+        material: s.material,
+        thicknessMm: s.thicknessMm,
+        wMm: s.wMm,
+        hMm: s.hMm,
+        priceCents: s.priceCents,
+        sheets: 0,
+        subtotalCents: 0
+      })
+    }
+    const line = materialLines[li]
+    line.sheets++
+    line.subtotalCents += s.priceCents
     totalCost += s.priceCents
+    boardsByType[s.boardName] = (boardsByType[s.boardName] ?? 0) + 1
   }
   let exposedM = 0
   let normalM = 0
@@ -360,18 +389,26 @@ export function nestJob(job: Job): NestResult {
     }
   }
 
-  const unplacedList: UnplacedInfo[] = [...unplaced.values()].map((u) => ({
-    partId: u.part.id,
-    code: u.part.code,
-    name: u.part.name,
-    qty: u.qty,
-    reason:
-      u.part.grain === 'none'
-        ? '板材尺寸或库存不足，无法排下'
-        : u.part.grain === 'length'
-          ? '因纹理要求为竖纹（不可旋转），现有板材排不下'
-          : '因纹理要求为横纹（不可旋转），现有板材排不下'
-  }))
+  const unplacedList: UnplacedInfo[] = [...unplaced.values()].map((u) => {
+    // 与选板分型走同一个判定，保证「排不下原因」口径一致；
+    // 几何上放得下却因装箱过程没放下（不该发生，留兜底）时退回通用文案
+    const all = job.boards.map(normalizeBoard)
+    const defs = new Map(all.map((b) => [b.id, b] as const))
+    const bk = blockKind(u.part, all, defs, kerf, trim)
+    return {
+      partId: u.part.id,
+      code: u.part.code,
+      name: u.part.name,
+      qty: u.qty,
+      reason: bk
+        ? bk.reason
+        : u.part.grain === 'none'
+          ? '板材尺寸或库存不足，无法排下'
+          : u.part.grain === 'length'
+            ? '因纹理要求为竖纹（不可旋转），现有板材排不下'
+            : '因纹理要求为横纹（不可旋转），现有板材排不下'
+    }
+  })
 
   const baselineBoards = shelfBaseline(job, boards, kerf, trim, results.length)
   const optimizedBoards = results.length
@@ -396,6 +433,7 @@ export function nestJob(job: Job): NestResult {
     sheets: results,
     boardsUsed: optimizedBoards,
     boardsByType,
+    materialLines,
     edgeBandM: {
       exposed: Math.round(exposedM * 100) / 100,
       normal: Math.round(normalM * 100) / 100

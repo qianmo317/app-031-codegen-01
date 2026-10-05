@@ -5,18 +5,28 @@ export function uid(prefix = 'id'): string {
 }
 
 export function money(cents: number): string {
+  // 金额内部一律以「分」（整数）存储与累加；展示折元，四舍五入到 0.01 元（分位）
   return `¥${(cents / 100).toFixed(2)}`
 }
 
+/** 元（可含小数）→ 分（整数）：四舍五入到整分，避免浮点尾巴。 */
+export function yuanToCents(yuan: number): number {
+  if (!Number.isFinite(yuan) || yuan < 0) return 0
+  return Math.round(yuan * 100)
+}
+
 export function mm(v: number): string {
+  // 长度内部 mm（浮点数坐标），展示四舍五入到整数 mm
   return `${Math.round(v)}`
 }
 
 export function areaM2(mm2: number): string {
+  // 面积内部按 mm² 整数累计；折 m²（÷1,000,000）保留 2 位小数（即 0.01m² / 10000mm² 位）
   return `${(mm2 / 1_000_000).toFixed(2)}m²`
 }
 
 export function pct(v: number): string {
+  // 利用率为无量纲比值（0~1），展示百分数保留 1 位小数
   return `${(v * 100).toFixed(1)}%`
 }
 

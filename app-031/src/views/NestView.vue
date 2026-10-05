@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import { getJob, runNest, runSelection, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
 import { pct, money } from '../lib/format'
 import SheetDiagram from '../components/SheetDiagram.vue'
+import SelectionBanner from '../components/SelectionBanner.vue'
 import { cabinetFill, cabinetStroke } from '../lib/colors'
 
 const route = useRoute()
@@ -66,9 +67,16 @@ function registerAll(): void {
 
 function rerun(): void {
   if (!job.value) return
-  runNest(job.value)
+  if (job.value.budgetCents > 0) {
+    const out = runSelection(job.value)
+    if (out.selection.status === 'conclusion') toast('已按同一内核重新选板排样', 'good')
+    else toast(out.selection.message, out.selection.status === 'inconclusive' ? 'info' : 'bad', 3400)
+  } else {
+    // 未设预算：按原排样内核重排（不出花费反算结论）
+    runNest(job.value)
+    toast('已重新排样（未设预算，未出选板结论）', 'good')
+  }
   activeSheet.value = 0
-  toast('已重新排样', 'good')
 }
 
 function onDrop(payload: { instanceId: string; xMm: number; yMm: number }): void {
@@ -142,14 +150,18 @@ function printNest(): void {
 
 <template>
   <div v-if="job && result">
+    <!-- 选板结论/失败分型/变化清单（三页同源组件） -->
+    <SelectionBanner v-if="result.selection" :job="job" />
+
     <!-- 总览条 -->
     <section class="panel kpi-bar">
       <div><b>{{ result.boardsUsed }}</b><span>板材（张）</span></div>
       <div><b>{{ pct(overallUtil) }}</b><span>综合利用率</span></div>
+      <div><b>{{ money(result.totalCostCents) }}</b><span>板材花费</span></div>
       <div><b>{{ (result.edgeBandM.exposed + result.edgeBandM.normal).toFixed(1) }}m</b><span>封边总长</span></div>
       <div class="hl"><b>省 {{ result.savedBoards }} 张</b><span>约 {{ money(result.savedCents) }}</span></div>
       <div class="spacer" />
-      <button class="sm" @click="rerun">重新排样</button>
+      <button class="sm" @click="rerun">重新选板排样</button>
       <button class="sm" @click="registerAll">登记全部余料</button>
       <button class="sm primary" @click="printNest">打印排样图</button>
       <router-link class="sm btn-like" :to="`/cut/${job.id}`">看裁切步骤 →</router-link>
@@ -177,6 +189,7 @@ function printNest(): void {
         >
           <b>第 {{ s.index + 1 }} 张</b>
           <span>{{ s.boardName.length > 14 ? s.material + ' ' + s.thicknessMm + 'mm' : s.boardName }}</span>
+          <span class="cost">{{ money(s.priceCents) }}</span>
           <span class="ut">{{ pct(s.utilization) }}</span>
         </button>
       </aside>
@@ -187,6 +200,7 @@ function printNest(): void {
           <b>第 {{ activeSheet + 1 }} 张 / 共 {{ result.sheets.length }} 张</b>
           <span class="tag">{{ sheet?.boardName }}</span>
           <span class="tag good">利用率 {{ pct(sheet?.utilization ?? 0) }}</span>
+          <span class="tag">本张摊 {{ money(sheet?.priceCents ?? 0) }}</span>
           <span v-if="sheet?.adjusted" class="tag warn">已手工微调</span>
           <div class="spacer" />
           <label class="row small" style="gap:4px">
@@ -349,6 +363,11 @@ function printNest(): void {
 .sheet-tab .ut {
   font-weight: 700;
   color: var(--c-accent);
+}
+.sheet-tab .cost {
+  font-size: 11px;
+  color: var(--c-primary);
+  font-variant-numeric: tabular-nums;
 }
 .sheet-tab.active {
   border-color: var(--c-primary);

@@ -153,7 +153,10 @@ function onFile(e: Event): void {
         <div class="row">
           <h3 style="font-size: 15px">{{ job.name }}</h3>
           <div class="spacer" />
-          <span v-if="job.result" class="tag good">已排样</span>
+          <span v-if="job.result?.selection?.status === 'conclusion'" class="tag good">选板结论 第{{ job.result.selection.revision }}版</span>
+          <span v-else-if="job.result?.selection?.status === 'budget'" class="tag" style="color:#b00">预算不够</span>
+          <span v-else-if="job.result?.selection?.status === 'blocked'" class="tag" style="color:#b00">{{ job.result.selection.blockKind === 'grain' ? '纹理卡死' : '板幅不够' }}</span>
+          <span v-else-if="job.result" class="tag good">已排样</span>
           <span v-else class="tag">未排样</span>
         </div>
         <p class="muted small" style="margin: 6px 0">

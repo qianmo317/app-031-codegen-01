@@ -1,8 +1,10 @@
 // 自动化断言（规格书 §8/§10 强制）：
 // guillotine 100 组随机零反例、纹理零旋转、锯路/修边、守恒、封边复算、
 // 30 零件锯切工步 ≤20 且模拟器还原、余料再利用、300 零件性能 <1.5s。
+// 另含选板与花费反算：同一内核、失败分型（纹理/板幅/预算）、厚度约束、二选一策略。
 import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
+import { selectBoards } from './selector'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
 
@@ -59,7 +61,8 @@ function makePart(over: Partial<Part> = {}): Part {
     edgeBands: over.edgeBands ?? [],
     cabinet: over.cabinet ?? '柜A',
     exposed: over.exposed ?? false,
-    boardId: over.boardId ?? ''
+    boardId: over.boardId ?? '',
+    thicknessMm: over.thicknessMm ?? 0
   }
 }
 
@@ -72,8 +75,11 @@ function makeJob(parts: Part[], over: Partial<Job> = {}): Job {
     parts,
     kerfMm: over.kerfMm ?? 3.2,
     trimMm: over.trimMm ?? 8,
+    budgetCents: over.budgetCents ?? 0,
+    strategy: over.strategy ?? 'cheapest',
     useOffcutIds: [],
     batchByCabinet: false,
+    selectionRevision: 0,
     ...over
   }
 }
@@ -270,19 +276,27 @@ export function runSelfTest(): SelfTestReport {
       : firstFailure
   )
 
-  // 2) 纹理无法满足时给原因而不是偷转
+  // 2) 纹理无法满足时给原因而不是偷转（含「板幅不够」与「纹理卡死」两类）
   {
     const job = makeJob([
-      makePart({ code: 'BIG', lenMm: 2500, widMm: 400, qty: 1, grain: 'length' }),
+      makePart({ code: 'GRAIN', lenMm: 1000, widMm: 1300, qty: 1, grain: 'length' }),
+      makePart({ code: 'SIZE', lenMm: 2500, widMm: 400, qty: 1, grain: 'length' }),
       makePart({ code: 'OK', lenMm: 400, widMm: 400, qty: 1 })
     ])
     const r = nestJob(job)
+    const byCode = Object.fromEntries(r.unplaced.map((u) => [u.code, u]))
     const ok =
-      r.unplaced.length === 1 &&
-      r.unplaced[0].code === 'BIG' &&
-      r.unplaced[0].reason.includes('纹理') &&
+      r.unplaced.length === 2 &&
+      byCode.GRAIN.reason.includes('纹理') &&
+      byCode.SIZE.reason.includes('板幅') &&
       r.sheets.reduce((a, s) => a + s.placements.length, 0) === 1
-    add('纹理排不下时明确提示且不强制旋转', ok, ok ? '提示：' + r.unplaced[0].reason : '未按预期报纹理冲突')
+    add(
+      '排不下时分清「纹理卡死/板幅不够」且不强制旋转',
+      ok,
+      ok
+        ? `纹理件：${byCode.GRAIN?.reason} ｜ 超幅件：${byCode.SIZE?.reason}`
+        : `未排下 ${r.unplaced.map((u) => u.code).join(',')}：${JSON.stringify(r.unplaced.map((u) => u.reason))}`
+    )
   }
 
   // 3) 锯路精确净距（两件相邻 = kerf）
@@ -438,6 +452,124 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 选板与花费反算：出结论 + 同源行 + 预算不够差额
+  {
+    const cheap = makeBoard({ id: 'c1', name: '小板 1830×915×18', wMm: 1830, hMm: 915, priceCents: 8600 })
+    const big = makeBoard({ id: 'b1', name: '大板 2440×1220×18', wMm: 2440, hMm: 1220, priceCents: 13800 })
+    const parts = [makePart({ code: 'Q1', lenMm: 800, widMm: 500, qty: 6 })]
+    const job = makeJob(parts, { boards: [cheap, big], budgetCents: 50000, strategy: 'cheapest' })
+    const out = selectBoards(job, [...job.boards], null)
+    const okConclusion =
+      out.selection.status === 'conclusion' &&
+      !!out.result &&
+      out.result.unplaced.length === 0 &&
+      out.result.materialLines.length >= 1 &&
+      // 同源：sheets 张数之和 = materialLines.sheets 之和
+      out.result.materialLines.reduce((a, l) => a + l.sheets, 0) === out.result.sheets.length &&
+      out.result.sheets.every((s) =>
+        out.result!.materialLines.some((l) => l.boardId === s.boardId && l.priceCents === s.priceCents)
+      )
+    add(
+      '选板反算：预算内出结论，且领料行与每张板（板种/摊价）同源',
+      okConclusion,
+      okConclusion
+        ? `${out.result!.materialLines.length} 种板 ${out.selection.totalSheets} 张 ${(
+            (out.selection.totalCostCents ?? 0) / 100
+          ).toFixed(2)} 元`
+        : `状态 ${out.selection.status}：${out.selection.message}`
+    )
+    // 把预算压到不可能：应判 budget，并给出差额
+    job.budgetCents = 100
+    const out2 = selectBoards(job, [...job.boards], null)
+    const okBudget =
+      out2.selection.status === 'budget' &&
+      (out2.selection.budgetShortCents ?? 0) === (out2.selection.cheapestCostCents ?? 0) - 100 &&
+      (out2.selection.budgetShortSheets ?? 0) >= 1
+    add(
+      '选板反算：排得下但预算顶穿时判「预算不够」，按最省算差多少钱/几张',
+      okBudget,
+      okBudget
+        ? `最省 ${out2.selection.cheapestCostCents} 分，差 ${out2.selection.budgetShortCents} 分，约 ${out2.selection.budgetShortSheets} 张`
+        : `状态 ${out2.selection.status}`
+    )
+    // 预算为 0 / 无零件：不出结论
+    job.budgetCents = 0
+    const out3 = selectBoards(job, [...job.boards], null)
+    job.budgetCents = 50000
+    const emptyJob = makeJob([], { boards: [cheap, big], budgetCents: 50000 })
+    const out4 = selectBoards(emptyJob, [...emptyJob.boards], null)
+    add(
+      '选板反算：预算为 0 或一件都没排时不出结论并讲清卡点',
+      out3.selection.status === 'inconclusive' &&
+        out3.selection.blockKind === 'zero-budget' &&
+        out4.selection.status === 'inconclusive' &&
+        out4.selection.blockKind === 'empty',
+      `预算0→${out3.selection.blockKind}；空清单→${out4.selection.blockKind}`
+    )
+  }
+
+  // 11) 失败分型：纹理卡死 vs 板幅不够
+  {
+    const board = makeBoard({ id: 'g1', name: '板 2440×1220×18', wMm: 2440, hMm: 1220 })
+    // 2500×300 竖纹：长边沿 x 需要 2500 > 2440-16；旋转后 300×2500 仍超过 1220 → 板幅不够
+    const tooLong = makePart({ code: 'TL', lenMm: 2500, widMm: 300, grain: 'length' })
+    const j1 = makeJob([tooLong], { boards: [board], budgetCents: 999999 })
+    const o1 = selectBoards(j1, [...j1.boards], null)
+    // 1300×400 竖纹：x 需要 1300（板宽方向 1220 不够？板 2440 长够，1220 宽放 400 够 → 实际能排下）
+    // 构造纹理卡死：1000×1300 竖纹 → x 放 1000、y 放 1300>1204 不行；旋转 x1300 y1000 可以
+    const grainLocked = makePart({ code: 'GL', lenMm: 1000, widMm: 1300, grain: 'length' })
+    const j2 = makeJob([grainLocked], { boards: [board], budgetCents: 999999 })
+    const o2 = selectBoards(j2, [...j2.boards], null)
+    add(
+      '选板分型：板幅不够 vs 纹理卡死（不许旋转硬塞）',
+      o1.selection.blockKind === 'size' && o2.selection.blockKind === 'grain',
+      `2500 竖纹→${o1.selection.blockKind}；1000×1300 竖纹→${o2.selection.blockKind}`
+    )
+  }
+
+  // 12) 指定厚度：件只能上同厚度板
+  {
+    const b18 = makeBoard({ id: 't18', name: '板 18', thicknessMm: 18, priceCents: 13800 })
+    const b25 = makeBoard({ id: 't25', name: '板 25', wMm: 2440, hMm: 1220, thicknessMm: 25, priceCents: 17500 })
+    const p25 = makePart({ code: 'P25', lenMm: 600, widMm: 400, qty: 2, thicknessMm: 25 })
+    const job = makeJob([p25], { boards: [b18, b25], budgetCents: 999999 })
+    const out = selectBoards(job, [...job.boards], null)
+    const ok =
+      out.selection.status === 'conclusion' &&
+      out.result!.sheets.every((s) => s.thicknessMm === 25)
+    add('指定厚度的件只排同厚度板', ok, ok ? `全部上 25mm` : `状态 ${out.selection.status}`)
+  }
+
+  // 13) 选板与排样同一内核：选板结果的每张板仍通过 guillotine 校验与切割模拟
+  {
+    const boards = [
+      makeBoard({ id: 'z1', name: 'Z18a', wMm: 2440, hMm: 1220, priceCents: 13800 }),
+      makeBoard({ id: 'z2', name: 'Z18b', wMm: 1830, hMm: 915, priceCents: 8600 }),
+      makeBoard({ id: 'z3', name: 'Z2745', wMm: 2745, hMm: 1220, priceCents: 16800 })
+    ]
+    const parts: Part[] = []
+    for (let i = 0; i < 24; i++) {
+      parts.push(
+        makePart({
+          code: `Z${i}`,
+          lenMm: 300 + (i % 5) * 120,
+          widMm: 200 + (i % 3) * 90,
+          qty: 1 + (i % 2),
+          grain: i % 4 === 0 ? 'length' : 'none'
+        })
+      )
+    }
+    const job = makeJob(parts, { boards, budgetCents: 999999, strategy: 'cheapest' })
+    const out = selectBoards(job, [...job.boards], null)
+    job.result = out.result
+    const err = out.result ? assertSheet(job) : '无结果'
+    add(
+      '选板枚举复用同一排样内核：结论每张板贯通合法、模拟还原',
+      out.selection.status === 'conclusion' && err === null,
+      err ?? `用板 ${out.result!.sheets.length} 张，全部通过 guillotine/模拟/锯路校验`
     )
   }
 

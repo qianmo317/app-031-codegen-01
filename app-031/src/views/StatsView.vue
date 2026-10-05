@@ -1,13 +1,36 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob } from '../lib/store'
+import {
+  getJob,
+  issueRequisition,
+  requisitionsForJob
+} from '../lib/store'
+import { printJob } from '../lib/print'
 import boardsData from '../data/boards.json'
 import { pct, money } from '../lib/format'
+import { toast } from '../lib/ui'
+import SelectionBanner from '../components/SelectionBanner.vue'
 
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
 const result = computed(() => job.value?.result)
+const selection = computed(() => result.value?.selection)
+const isConclusion = computed(() => selection.value?.status === 'conclusion')
+const requisitions = computed(() => (job.value ? requisitionsForJob(job.value.id) : []))
+
+function onIssue(): void {
+  if (!job.value) return
+  const rec = issueRequisition(job.value)
+  if (rec) {
+    toast(`已签发第 ${rec.revision} 版领料单据并存入本机台账（${money(rec.totalCostCents)}）`, 'good', 3600)
+  } else {
+    toast('只有「选板结论」状态才能签发领料单（预算不够/排不下/未设预算均不签发）', 'bad', 3800)
+  }
+}
+function printOrder(): void {
+  if (job.value) printJob(job.value.id, ['order'])
+}
 
 const totalPieces = computed(
   () => result.value?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0
@@ -52,16 +75,22 @@ const utilMinMax = computed(() => {
 
 <template>
   <div v-if="job && result">
+    <!-- 选板结论/失败分型/变化清单（三页同源组件） -->
+    <SelectionBanner v-if="result.selection" :job="job" />
+
     <!-- 师傅最关心的一句话 -->
     <section class="panel headline">
       <div class="hl-text">
         <h2>
-          本方案用 <b>{{ result.boardsUsed }}</b> 张板，
+          本方案用 <b>{{ result.boardsUsed }}</b> 张板（{{ result.materialLines.length }} 种板），
+          花费 <b class="hl">{{ money(result.totalCostCents) }}</b>，
           比随手排省 <b class="hl">{{ result.savedBoards }}</b> 张
           <span class="hl-money">约 {{ money(result.savedCents) }}</span>
         </h2>
-        <p class="muted">
-          朴素顺板需要 {{ result.baselineBoards }} 张（原清单顺序、不旋转、货架式摆法）；
+        <p class="muted" v-if="selection">
+          取舍：{{ selection.strategy === 'cheapest' ? '先挑最省（总价优先）' : '先挑最大板幅（张数优先）' }} ·
+          结论第 {{ selection.revision }} 版 ·
+          朴素顺板需要 {{ result.baselineBoards }} 张；
           本方案综合利用率 {{ pct(overallUtil) }}，
           单板区间 {{ pct(utilMinMax.min) }} ~ {{ pct(utilMinMax.max) }}。
         </p>
@@ -77,24 +106,48 @@ const utilMinMax = computed(() => {
 
     <div class="stat-grid">
       <section class="panel">
-        <h3>板材领料</h3>
+        <div class="row" style="margin-bottom: 8px">
+          <h3 style="margin: 0">板材领料（与明细页/排样页同源）</h3>
+          <div class="spacer" />
+          <button class="sm primary" :disabled="!isConclusion" @click="onIssue">签发领料单据（存档）</button>
+          <button class="sm" @click="printOrder">打印下料单</button>
+        </div>
         <table class="grid">
           <thead>
-            <tr><th>板材</th><th>张数</th><th>单价</th><th>小计</th></tr>
+            <tr><th>板材</th><th>规格(mm)</th><th>厚</th><th>张数</th><th>单价</th><th>小计</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(n, name) in result.boardsByType" :key="name">
-              <td>{{ name }}</td>
-              <td>{{ n }}</td>
-              <td>{{ money(result.sheets.find((x) => x.boardName === name)?.priceCents ?? 0) }}</td>
-              <td>{{ money((result.sheets.find((x) => x.boardName === name)?.priceCents ?? 0) * Number(n)) }}</td>
+            <tr v-for="line in result.materialLines" :key="line.boardId">
+              <td>{{ line.boardName }}</td>
+              <td>{{ line.wMm }}×{{ line.hMm }}</td>
+              <td>{{ line.thicknessMm }}</td>
+              <td>{{ line.sheets }}</td>
+              <td>{{ money(line.priceCents) }}</td>
+              <td>{{ money(line.subtotalCents) }}</td>
             </tr>
           </tbody>
           <tfoot>
-            <tr><td colspan="3"><b>板材成本合计</b></td><td><b>{{ money(result.totalCostCents) }}</b></td></tr>
+            <tr><td colspan="5"><b>板材成本合计（预算 {{ selection ? money(selection.budgetCents) : '—' }}）</b></td><td><b>{{ money(result.totalCostCents) }}</b></td></tr>
           </tfoot>
         </table>
-        <p class="small muted" style="margin-top: 8px">排样计算耗时 {{ result.elapsedMs }}ms。</p>
+        <p class="small muted" style="margin-top: 8px">
+          金额以分整数累计，折元四舍五入到 0.01 元；排样计算耗时 {{ result.elapsedMs }}ms。
+          <span v-if="selection && selection.status !== 'conclusion'" class="warn-text">
+            当前不是正式选板结论（{{ selection.status === 'budget' ? '预算不够' : selection.status === 'blocked' ? (selection.blockKind === 'grain' ? '纹理卡死' : '板幅不够') : '不出结论' }}），领料单不可签发。
+          </span>
+        </p>
+
+        <!-- 本机领料单台账：已签发 / 已作废 -->
+        <div v-if="requisitions.length > 0" class="req-ledger">
+          <h4 class="small">本机领料单据台账</h4>
+          <div v-for="r in requisitions" :key="r.id" class="req-row" :class="{ voided: r.voided }">
+            <b>第 {{ r.revision }} 版</b>
+            <span>{{ new Date(r.issuedAt).toLocaleString('zh-CN') }}</span>
+            <span>{{ r.totalSheets }} 张 / {{ money(r.totalCostCents) }}</span>
+            <span :class="r.voided ? 'void-tag' : 'ok-tag'">{{ r.voided ? '已作废' : '有效' }}</span>
+            <span v-if="r.voided" class="small muted">{{ r.voidReason }}</span>
+          </div>
+        </div>
       </section>
 
       <section class="panel">
@@ -183,6 +236,40 @@ const utilMinMax = computed(() => {
   padding: 9px 14px;
   margin-bottom: 12px;
   font-size: 13px;
+}
+.warn-text {
+  color: var(--c-bad);
+  font-weight: 600;
+}
+.req-ledger {
+  margin-top: 12px;
+  border-top: 1px dashed var(--c-line);
+  padding-top: 8px;
+}
+.req-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-size: 12px;
+  padding: 3px 0;
+}
+.req-row.voided {
+  color: var(--c-ink-2);
+  text-decoration: line-through;
+}
+.req-row.voided .void-tag {
+  text-decoration: none;
+  color: var(--c-bad);
+  border: 1px solid #eecfcf;
+  border-radius: 4px;
+  padding: 0 6px;
+}
+.ok-tag {
+  color: #14745a;
+  border: 1px solid #9ed3be;
+  border-radius: 4px;
+  padding: 0 6px;
 }
 .stat-grid {
   display: grid;
