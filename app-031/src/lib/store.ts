@@ -1,7 +1,17 @@
 // 全局状态：Vue reactive 单例 + localStorage 持久化（无 Pinia/Vuex）
 import { reactive, computed } from 'vue'
-import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
+import type {
+  Board,
+  IssuedOrder,
+  Job,
+  NestResult,
+  Part,
+  PlanChange,
+  RegisteredOffcut,
+  SheetResult
+} from '../types'
 import { nestJob } from './packing'
+import { selectBoards, buildSnapshot, diffSnapshots, type PlanSnapshot } from './boardSelect'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
 import { uid } from './format'
@@ -9,10 +19,12 @@ import boardsData from '../data/boards.json'
 
 const JOBS_KEY = 'fco.jobs.v1'
 const OFFCUTS_KEY = 'fco.offcuts.v1'
+const ORDERS_KEY = 'fco.orders.v1'
 
 interface State {
   jobs: Job[]
   offcuts: RegisteredOffcut[]
+  orders: IssuedOrder[]
   loaded: boolean
 }
 
@@ -31,18 +43,28 @@ function load<T>(key: string, fallback: T): T {
 const state = reactive<State>({
   jobs: [],
   offcuts: [],
+  orders: [],
   loaded: false
 })
 
 function persist(): void {
   localStorage.setItem(JOBS_KEY, JSON.stringify(state.jobs))
   localStorage.setItem(OFFCUTS_KEY, JSON.stringify(state.offcuts))
+  localStorage.setItem(ORDERS_KEY, JSON.stringify(state.orders))
+}
+
+function migrateJob(j: Job): Job {
+  if (j.budgetCents === undefined) j.budgetCents = -1
+  if (!j.boardStrategy) j.boardStrategy = 'cheapest'
+  if (j.useOffcutIds === undefined) j.useOffcutIds = []
+  return j
 }
 
 function init(): void {
   if (state.loaded) return
-  state.jobs = load<Job[]>(JOBS_KEY, [])
+  state.jobs = load<Job[]>(JOBS_KEY, []).map(migrateJob)
   state.offcuts = load<RegisteredOffcut[]>(OFFCUTS_KEY, [])
+  state.orders = load<IssuedOrder[]>(ORDERS_KEY, [])
   state.loaded = true
 }
 
@@ -84,7 +106,9 @@ export function createJob(name: string): Job {
     kerfMm: boardsData.defaults.kerfMm,
     trimMm: boardsData.defaults.trimMm,
     useOffcutIds: [],
-    batchByCabinet: false
+    batchByCabinet: false,
+    budgetCents: -1,
+    boardStrategy: 'cheapest'
   }
   state.jobs.unshift(job)
   persist()
@@ -138,22 +162,232 @@ function boardsWithOffcuts(job: Job): Board[] {
   return [...offcutBoards, ...job.boards]
 }
 
+/**
+ * 排样 + 选板反算，三处页面（板件明细/排样结果/材料统计）与领料单唯一同源入口。
+ * 选板和最终摆法来自同一次 selectBoards() 内的 pack 输出，绝不重排出第二套摆法。
+ */
+export interface RunNestOutcome {
+  result: NestResult
+  change: PlanChange | null
+}
+
 export function runNest(job: Job): NestResult {
+  return runNestWithChange(job).result
+}
+
+export function runNestWithChange(job: Job): RunNestOutcome {
+  migrateJob(job)
   const effective: Job = { ...job, boards: boardsWithOffcuts(job) }
-  const result = nestJob(effective)
-  // 标记被用掉的余料
-  const usedOffcutBoardIds = new Set(
-    result.sheets.filter((s) => s.boardId.startsWith('offcut_')).map((s) => s.boardId)
-  )
+
+  // 重算前抓上一版快照（用于逐条列出变化）
+  const before: PlanSnapshot | null = job.result
+    ? buildSnapshot(job.result, {
+        kerfMm: job.kerfMm,
+        trimMm: job.trimMm,
+        budgetCents: job.budgetCents,
+        strategy: job.boardStrategy
+      })
+    : null
+
+  const selection = selectBoards({
+    boards: effective.boards,
+    parts: job.parts,
+    kerfMm: job.kerfMm,
+    trimMm: job.trimMm,
+    batchByCabinet: job.batchByCabinet,
+    budgetCents: job.budgetCents,
+    strategy: job.boardStrategy
+  })
+
+  // 采纳摆法：可行/预算不够 → 策略或最省方案；板幅纹理卡死/预算为零/零件为空 → 试排参考
+  const chosenPack = selection.chosenPack
+  const result =
+    chosenPack && chosenPack.sheets.length > 0
+      ? nestJob(effective, { pack: chosenPack, boardSelect: selection.report })
+      : nestJob(effective, { boardSelect: selection.report })
+
+  // 余料状态：先把「本单上轮占用、本轮仍勾选参与」的余料归还，再按新方案重新占用。
+  // 试排（不可行/预算为零/零件为空）不占用任何余料。
   for (const oc of state.offcuts) {
-    if (usedOffcutBoardIds.has(`offcut_${oc.id}`)) {
-      oc.available = false
-      oc.usedByJobId = job.id
+    if (oc.usedByJobId === job.id && job.useOffcutIds.includes(oc.id)) {
+      oc.available = true
+      oc.usedByJobId = undefined
     }
   }
+  if (selection.report.status === 'feasible') {
+    const usedOffcutBoardIds = new Set(
+      result.sheets.filter((s) => s.boardId.startsWith('offcut_')).map((s) => s.boardId)
+    )
+    for (const oc of state.offcuts) {
+      if (usedOffcutBoardIds.has(`offcut_${oc.id}`)) {
+        oc.available = false
+        oc.usedByJobId = job.id
+      }
+    }
+  }
+
   job.result = result
+
+  // 逐项变化清单（板种张数 / 换板 / 每张板板种 / 成本表行 / 参数）
+  const after = buildSnapshot(result, {
+    kerfMm: job.kerfMm,
+    trimMm: job.trimMm,
+    budgetCents: job.budgetCents,
+    strategy: job.boardStrategy
+  })
+
+  // 记录本次采纳时的参数与签名（明细页据此提示「改了锯路/修边/板价 → 结论过期」）
+  job.lastRun = {
+    kerfMm: job.kerfMm,
+    trimMm: job.trimMm,
+    budgetCents: job.budgetCents,
+    boardStrategy: job.boardStrategy,
+    fingerprint: after.fingerprint,
+    partsSig: partsSignature(job),
+    boardsSig: boardsSignature(job)
+  }
+
+  const change = before ? diffSnapshots(before, after) : null
+  if (change && before) {
+    // 已存档并导出的领料单据：指纹变了一律作废重来
+    change.orderEffects = state.orders
+      .filter((o) => o.jobId === job.id && !o.voided)
+      .map((o) => {
+        const stale = o.fingerprint !== after.fingerprint
+        return {
+          issuedOrderId: o.id,
+          issuedAt: o.issuedAt,
+          status: stale ? ('void' as const) : ('keep' as const),
+          reason: stale
+            ? `锯路/修边/板价/选板变动使指纹 ${o.fingerprint} → ${after.fingerprint}，旧领料单作废`
+            : '指纹一致，单据继续有效'
+        }
+      })
+    for (const o of state.orders) {
+      if (o.jobId !== job.id || o.voided) continue
+      const eff = change.orderEffects.find((e) => e.issuedOrderId === o.id)
+      if (eff?.status === 'void') {
+        o.voided = true
+        o.voidReason = eff.reason
+      }
+    }
+  }
+  if (change) lastChanges.set(job.id, change)
+
   persist()
-  return result
+  return { result, change }
+}
+
+/** 内存态：每个项目最近一次重算的逐项变化（三个页面顶部都可查看，不持久化） */
+const lastChanges = new Map<string, PlanChange>()
+
+export function getLastChange(jobId: string): PlanChange | null {
+  return lastChanges.get(jobId) ?? null
+}
+export function clearLastChange(jobId: string): void {
+  lastChanges.delete(jobId)
+}
+
+/** 上一版排样是否因锯路/修边/板价/板件/策略变化已经过期（明细页提示用）。 */
+export function isResultStale(job: Job): boolean {
+  const lr = job.lastRun
+  if (!job.result || !lr) return false
+  return (
+    lr.kerfMm !== job.kerfMm ||
+    lr.trimMm !== job.trimMm ||
+    lr.budgetCents !== job.budgetCents ||
+    lr.boardStrategy !== job.boardStrategy ||
+    lr.partsSig !== partsSignature(job) ||
+    lr.boardsSig !== boardsSignature(job)
+  )
+}
+
+function partsSignature(job: Job): string {
+  return job.parts
+    .map(
+      (p) =>
+        `${p.id}:${p.lenMm}x${p.widMm}x${p.qty}:${p.grain}:${p.boardId ?? ''}:${p.thicknessMm ?? 0}:${[...p.edgeBands].sort().join('')}`
+    )
+    .join('|')
+}
+
+function boardsSignature(job: Job): string {
+  return job.boards
+    .map((b) => `${b.id}:${b.wMm}x${b.hMm}x${b.thicknessMm}@${b.priceCents}q${b.quantity}`)
+    .join('|')
+}
+
+// ── 领料单据存档（本机）：只按可行选板结论登记；指纹变了由 runNestWithChange 作废 ──
+
+export function issueOrder(job: Job): IssuedOrder | null {
+  if (!job.result || !job.result.boardSelect || job.result.boardSelect.status !== 'feasible') {
+    return null
+  }
+  const r = job.result
+  const params = {
+    kerfMm: job.kerfMm,
+    trimMm: job.trimMm,
+    budgetCents: job.budgetCents,
+    strategy: job.boardStrategy
+  }
+  const snap = buildSnapshot(r, params)
+  const order: IssuedOrder = {
+    id: uid('ord'),
+    jobId: job.id,
+    jobName: job.name,
+    issuedAt: Date.now(),
+    fingerprint: snap.fingerprint,
+    summary: {
+      boardsUsed: r.boardsUsed,
+      totalCostCents: r.totalCostCents,
+      byBoard: [...snap.rows.entries()].map(([id, x]) => ({
+        boardId: id,
+        boardName: x.boardName,
+        sheets: x.sheets,
+        subtotalCents: x.subtotalCents
+      }))
+    },
+    voided: false
+  }
+  state.orders.unshift(order)
+  persist()
+  return order
+}
+
+export function ordersForJob(jobId: string): IssuedOrder[] {
+  init()
+  return state.orders.filter((o) => o.jobId === jobId)
+}
+
+/**
+ * 三处页面（板件明细/排样结果/材料统计）与领料单据共用的取数入口。
+ * 板种、张数、单价、小计一律只认 result.boardSelect.plan；
+ * 选板无可行结论（预算不够/板幅纹理卡死/预算为零/零件为空）时返回 null，
+ * 调用方必须展示卡点而不是回退到旧的 boardsByType（防止一新一旧）。
+ */
+export interface PlanRow {
+  boardId: string
+  boardName: string
+  material: string
+  wMm: number
+  hMm: number
+  thicknessMm: number
+  sheets: number
+  priceCents: number
+  subtotalCents: number
+  isOffcut: boolean
+}
+
+export function planRows(result?: NestResult | null): PlanRow[] {
+  const plan = result?.boardSelect?.plan
+  if (!plan) return []
+  return plan.items.map((it) => ({ ...it }))
+}
+
+/** 每张板摊到的钱：余料板 0；常规板按其板种单价（与 plan 同源）。 */
+export function sheetCostRows(result?: NestResult | null): { index: number; boardName: string; priceCents: number }[] {
+  if (!result) return []
+  return result.sheets.map((s) => ({ index: s.index, boardName: s.boardName, priceCents: s.priceCents }))
 }
 
 /** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
@@ -352,7 +586,8 @@ export function newPart(partial: Partial<Part> = {}): Part {
     edgeBands: partial.edgeBands ?? [],
     cabinet: partial.cabinet ?? '未分组',
     exposed: partial.exposed ?? false,
-    boardId: partial.boardId ?? ''
+    boardId: partial.boardId ?? '',
+    thicknessMm: partial.thicknessMm ?? 0
   }
 }
 
@@ -380,7 +615,8 @@ export function useStore() {
   return {
     state,
     jobs: computed(() => state.jobs),
-    offcuts: computed(() => state.offcuts)
+    offcuts: computed(() => state.offcuts),
+    orders: computed(() => state.orders)
   }
 }
 

@@ -2,7 +2,8 @@
 // guillotine 100 组随机零反例、纹理零旋转、锯路/修边、守恒、封边复算、
 // 30 零件锯切工步 ≤20 且模拟器还原、余料再利用、300 零件性能 <1.5s。
 import type { Board, Job, Part } from '../types'
-import { nestJob } from './packing'
+import { nestJob, packBoards } from './packing'
+import { selectBoards, buildSnapshot, diffSnapshots } from './boardSelect'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
 
@@ -47,19 +48,20 @@ function makeBoard(over: Partial<Board> = {}): Board {
   }
 }
 
-function makePart(over: Partial<Part> = {}): Part {
+function makePart(over: Partial<Part> & { l?: number; w?: number } = {}): Part {
   return {
     id: `p${partSeq++}`,
     code: over.code ?? `P${partSeq}`,
     name: over.name ?? '测试件',
-    lenMm: over.lenMm ?? 400,
-    widMm: over.widMm ?? 300,
+    lenMm: over.lenMm ?? over.l ?? 400,
+    widMm: over.widMm ?? over.w ?? 300,
     qty: over.qty ?? 1,
     grain: over.grain ?? 'none',
     edgeBands: over.edgeBands ?? [],
     cabinet: over.cabinet ?? '柜A',
     exposed: over.exposed ?? false,
-    boardId: over.boardId ?? ''
+    boardId: over.boardId ?? '',
+    thicknessMm: over.thicknessMm ?? 0
   }
 }
 
@@ -74,6 +76,8 @@ function makeJob(parts: Part[], over: Partial<Job> = {}): Job {
     trimMm: over.trimMm ?? 8,
     useOffcutIds: [],
     batchByCabinet: false,
+    budgetCents: -1,
+    boardStrategy: 'cheapest',
     ...over
   }
 }
@@ -438,6 +442,194 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 选板反算：最省 vs 板幅最大两条路只选其一，取舍可验证
+  {
+    const big = makeBoard({ id: 'big', name: '大板2440', wMm: 2440, hMm: 1220, priceCents: 13800 })
+    const small = makeBoard({ id: 'small', name: '小板1830', wMm: 1830, hMm: 915, priceCents: 8600 })
+    const parts = [
+      makePart({ code: 'LONG', lenMm: 2000, widMm: 500, qty: 2, grain: 'length' }),
+      makePart({ code: 'S', lenMm: 700, widMm: 400, qty: 6 })
+    ]
+    const inp = { boards: [big, small], parts, kerfMm: 3.2, trimMm: 8, batchByCabinet: false }
+    const cheap = selectBoards({ ...inp, budgetCents: -1, strategy: 'cheapest' })
+    const large = selectBoards({ ...inp, budgetCents: -1, strategy: 'largest' })
+    const cp = cheap.report.plan!
+    const lp = large.report.plan!
+    const ok =
+      cp.totalCostCents < lp.totalCostCents &&
+      cp.items.length >= 2 &&
+      lp.items.every((i) => i.boardId !== 'small' || i.sheets === 0) &&
+      lp.boardsUsed <= cp.boardsUsed
+    add(
+      '选板：先最省（多板种/更便宜）与先板幅最大（少张数/可能更贵）结论不同且各自成立',
+      ok,
+      `最省 ${cp.boardKinds} 种 ${cp.boardsUsed} 张 ¥${cp.totalCostCents}；板幅最大 ${lp.boardKinds} 种 ${lp.boardsUsed} 张 ¥${lp.totalCostCents}`
+    )
+  }
+
+  // 11) 选板失败分类：预算不够给差额（按分），板幅/纹理/板种要分清
+  {
+    const b = makeBoard({ id: 'b1', priceCents: 13800 })
+    const mkJobParts = (): Part[] => [makePart({ code: 'P', lenMm: 1000, widMm: 500, qty: 10 })]
+    const budget = selectBoards({
+      boards: [b],
+      parts: mkJobParts(),
+      kerfMm: 3.2,
+      trimMm: 8,
+      batchByCabinet: false,
+      budgetCents: 20000,
+      strategy: 'cheapest'
+    })
+    const okBudget =
+      budget.report.status === 'blocked' &&
+      budget.report.blockers[0]?.block === 'budget' &&
+      budget.report.gap?.kind === 'money' &&
+      budget.report.gap.shortCents === budget.report.gap.cheapestCents! - 20000 &&
+      !!budget.report.referencePlan
+
+    const size = selectBoards({
+      boards: [makeBoard({ id: 'sm', wMm: 1830, hMm: 915, priceCents: 8600 })],
+      parts: [makePart({ code: 'BIG', l: 2000, w: 800 })],
+      kerfMm: 3.2,
+      trimMm: 8,
+      batchByCabinet: false,
+      budgetCents: -1,
+      strategy: 'cheapest'
+    })
+    const grain = selectBoards({
+      boards: [makeBoard({ id: 'sq', wMm: 1066, hMm: 866, priceCents: 8600 })],
+      parts: [makePart({ code: 'G', l: 800, w: 1000, grain: 'length' })],
+      kerfMm: 3.2,
+      trimMm: 8,
+      batchByCabinet: false,
+      budgetCents: -1,
+      strategy: 'cheapest'
+    })
+    const spec = selectBoards({
+      boards: [b],
+      parts: [makePart({ code: 'T', lenMm: 500, widMm: 400, qty: 2, thicknessMm: 25 })],
+      kerfMm: 3.2,
+      trimMm: 8,
+      batchByCabinet: false,
+      budgetCents: -1,
+      strategy: 'cheapest'
+    })
+    const okKinds =
+      size.report.blockers[0]?.block === 'size' &&
+      grain.report.blockers[0]?.block === 'grain' &&
+      spec.report.blockers[0]?.block === 'spec'
+    add(
+      '选板：预算不够按分给差额，板幅/纹理/板种三类卡点分清',
+      okBudget && okKinds,
+      `预算差额 ${budget.report.gap?.shortCents} 分；size/grain/spec = ${okKinds}`
+    )
+  }
+
+  // 12) 零件为空或预算为零：不下结论
+  {
+    const b = makeBoard()
+    const empty = selectBoards({ boards: [b], parts: [], kerfMm: 3.2, trimMm: 8, batchByCabinet: false, budgetCents: -1, strategy: 'cheapest' })
+    const zero = selectBoards({
+      boards: [b],
+      parts: [makePart({ code: 'P', lenMm: 500, widMm: 400 })],
+      kerfMm: 3.2,
+      trimMm: 8,
+      batchByCabinet: false,
+      budgetCents: 0,
+      strategy: 'cheapest'
+    })
+    const ok =
+      empty.report.status === 'inconclusive' &&
+      empty.report.plan === null &&
+      zero.report.status === 'inconclusive' &&
+      zero.report.plan === null &&
+      zero.report.steps.some((s) => s.includes('预算为零'))
+    add('选板：零件一件没有或预算为零时不出结论并说清卡点', ok, ok ? '均为 inconclusive' : '错误给出了结论')
+  }
+
+  // 13) 选板与最终摆法同源：选板 pack 直接成为 nestJob 输出，不允许第二套摆法
+  {
+    const big = makeBoard({ id: 'big', name: '大板', priceCents: 13800 })
+    const small = makeBoard({ id: 'small', name: '小板', wMm: 1830, hMm: 915, priceCents: 8600 })
+    const parts = [
+      makePart({ code: 'LONG', lenMm: 2000, widMm: 500, qty: 2, grain: 'length' }),
+      makePart({ code: 'S', lenMm: 700, widMm: 400, qty: 6 })
+    ]
+    const sel = selectBoards({ boards: [big, small], parts, kerfMm: 3.2, trimMm: 8, batchByCabinet: false, budgetCents: -1, strategy: 'cheapest' })
+    const job = makeJob(parts, { boards: [big, small] })
+    const r = nestJob(job, { pack: sel.chosenPack!, boardSelect: sel.report })
+    const same =
+      r.sheets.length === sel.chosenPack!.sheets.length &&
+      r.sheets.every((s, i) => s.placements.length === sel.chosenPack!.sheets[i].placements.length) &&
+      r.boardSelect === sel.report
+    add(
+      '选板 pack 与三处消费的 NestResult 是同一次排样（无第二套摆法）',
+      same,
+      same ? 'sheets/placements 完全一致' : '摆法出现分叉'
+    )
+  }
+
+  // 13b) 同源强校验：plan 的板种×张数 = 最终 sheets 的逐张统计（领料/统计/明细同源）
+  {
+    const big = makeBoard({ id: 'big', name: '大板', priceCents: 13800 })
+    const small = makeBoard({ id: 'small', name: '小板', wMm: 1830, hMm: 915, priceCents: 8600 })
+    const parts = [
+      makePart({ code: 'LONG', lenMm: 2000, widMm: 500, qty: 2, grain: 'length' }),
+      makePart({ code: 'S', lenMm: 700, widMm: 400, qty: 6, thicknessMm: 0 })
+    ]
+    const sel = selectBoards({ boards: [big, small], parts, kerfMm: 3.2, trimMm: 8, batchByCabinet: false, budgetCents: -1, strategy: 'cheapest' })
+    const job = makeJob(parts, { boards: [big, small] })
+    const r = nestJob(job, { pack: sel.chosenPack!, boardSelect: sel.report })
+    // 逐板种：plan 张数 == sheets 中该板出现次数；小计 == 各张 priceCents 之和
+    const sheetCount = new Map<string, { n: number; sum: number }>()
+    for (const s of r.sheets) {
+      const c = sheetCount.get(s.boardId) ?? { n: 0, sum: 0 }
+      c.n++
+      c.sum += s.priceCents
+      sheetCount.set(s.boardId, c)
+    }
+    const ok =
+      r.boardSelect?.plan?.items.every((it) => {
+        const c = sheetCount.get(it.boardId)
+        return c && c.n === it.sheets && c.sum === it.subtotalCents
+      }) &&
+      r.boardSelect?.plan?.totalCostCents === r.totalCostCents &&
+      sheetCount.size === r.boardSelect.plan.items.length
+    add(
+      '三处同源：选板 plan 的板种/张数/小计与最终 sheets 逐张统计完全一致',
+      !!ok,
+      ok ? `${sheetCount.size} 个板种全部一致` : 'plan 与 sheets 出现一新一旧'
+    )
+  }
+
+  // 14) 变化清单：改板价/锯路后板种行、成本合计、指纹变化；未改时无变化
+  {
+    const big = makeBoard({ id: 'big', name: '大板', priceCents: 13800 })
+    const small = makeBoard({ id: 'small', name: '小板', wMm: 1830, hMm: 915, priceCents: 8600 })
+    const parts = [makePart({ code: 'S', lenMm: 700, widMm: 400, qty: 6 })]
+    const job = makeJob(parts, { boards: [big, small] })
+    const pack1 = packBoards({ boards: [big, small], parts, kerfMm: 3.2, trimMm: 8, batchByCabinet: false, policy: 'cheapest' })
+    job.result = nestJob(job, { pack: pack1 })
+    const snap1 = buildSnapshot(job.result, { kerfMm: 3.2, trimMm: 8, budgetCents: -1, strategy: 'cheapest' })
+    const same = diffSnapshots(snap1, snap1)
+    const small2 = { ...small, priceCents: 9900 }
+    const pack2 = packBoards({ boards: [big, small2], parts, kerfMm: 4.0, trimMm: 8, batchByCabinet: false, policy: 'cheapest' })
+    job.result = nestJob({ ...job, boards: [big, small2], kerfMm: 4.0 }, { pack: pack2 })
+    const snap2 = buildSnapshot(job.result, { kerfMm: 4.0, trimMm: 8, budgetCents: -1, strategy: 'cheapest' })
+    const d = diffSnapshots(snap1, snap2)
+    const ok =
+      !same.changed &&
+      d.changed &&
+      d.fingerprintChanged &&
+      d.costTableRows.length > 0 &&
+      d.paramChanges.some((x) => x.includes('锯路'))
+    add(
+      '重算变化清单：板价/锯路变动能列出成本表行与参数，指纹随之改变；无变动时报告无变化',
+      ok,
+      ok ? `成本行 ${d.costTableRows.length} 条，参数 ${d.paramChanges.join('/')}` : '变化检测缺失'
     )
   }
 

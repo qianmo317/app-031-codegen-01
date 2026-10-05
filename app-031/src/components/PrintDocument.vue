@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { printState } from '../lib/print'
-import { getJob } from '../lib/store'
+import { getJob, planRows } from '../lib/store'
 import boardsData from '../data/boards.json'
 import SheetDiagram from './SheetDiagram.vue'
 import { money, mm } from '../lib/format'
+import { snapshotFingerprint } from '../lib/boardSelect'
 
 const job = computed(() => (printState.jobId ? getJob(printState.jobId) : undefined))
 const sections = computed(() => new Set(printState.sections))
@@ -15,6 +16,21 @@ const allInstances = computed(() => {
   return job.value.result.sheets.flatMap((s) => s.placements)
 })
 
+// 领料单取数：只从选板 plan 取（与板件明细页/排样结果页/材料统计页同源）
+const plan = computed(() => job.value?.result?.boardSelect?.plan ?? null)
+const feasible = computed(() => job.value?.result?.boardSelect?.status === 'feasible')
+const orderRows = computed(() => planRows(job.value?.result))
+const currentFingerprint = computed(() =>
+  job.value?.result
+    ? snapshotFingerprint(job.value.result.sheets, {
+        kerfMm: job.value.kerfMm,
+        trimMm: job.value.trimMm,
+        budgetCents: job.value.budgetCents,
+        strategy: job.value.boardStrategy
+      })
+    : ''
+)
+
 interface OrderRow {
   code: string
   name: string
@@ -24,34 +40,36 @@ interface OrderRow {
   grain: string
   edgeCount: number
   exposed: boolean
+  boardName: string
+}
+function sheetNameOf(boardIndex: number): string {
+  return job.value?.result?.sheets[boardIndex]?.boardName ?? ''
 }
 const cabinetGroups = computed(() => {
   const map = new Map<string, OrderRow[]>()
-  for (const p of allInstances.value) {
-    const arr = map.get(p.cabinet) ?? []
-    const cur = arr.find((r) => r.code === p.code)
+  for (const s of allInstances.value) {
+    const arr = map.get(s.cabinet) ?? []
+    const cur = arr.find((r) => r.code === s.code)
     if (cur) cur.qty++
     else
       arr.push({
-        code: p.code,
-        name: p.name,
-        origLen: p.origLen,
-        origWid: p.origWid,
+        code: s.code,
+        name: s.name,
+        origLen: s.origLen,
+        origWid: s.origWid,
         qty: 1,
-        grain: p.grain,
-        edgeCount: p.edgeBands.length,
-        exposed: p.exposed
+        grain: s.grain,
+        edgeCount: s.edgeBands.length,
+        exposed: s.exposed,
+        boardName: sheetNameOf(s.boardIndex)
       })
-    map.set(p.cabinet, arr)
+    map.set(s.cabinet, arr)
   }
   return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh'))
 })
 
 const grainText = (g: string): string =>
   g === 'length' ? '竖纹' : g === 'width' ? '横纹' : '无要求'
-
-const boardByName = (name: string) =>
-  job.value?.result?.sheets.find((x) => x.boardName === name)
 </script>
 
 <template>
@@ -122,31 +140,44 @@ const boardByName = (name: string) =>
       </section>
     </div>
 
-    <!-- 下料单 / 领料单 -->
+    <!-- 下料单 / 领料单（只按可行选板结论出；不可行时打印作废/禁用提示，不产出旧板种领料行） -->
     <div v-if="sections.has('order')">
       <section class="print-page">
         <h2>下料单 / 领料单</h2>
-        <p class="doc-meta">项目：{{ job.name }} ｜ 打印时间：{{ now }}</p>
+        <p class="doc-meta">
+          项目：{{ job.name }} ｜ 打印时间：{{ now }}<br />
+          策略：{{ job.boardStrategy === 'cheapest' ? '先挑最省' : '先挑板幅最大' }} ｜
+          预算：{{ job.budgetCents < 0 ? '不设限' : job.budgetCents === 0 ? '¥0.00（零预算）' : money(job.budgetCents) }} ｜
+          锯路 {{ job.kerfMm }}mm ｜ 修边 {{ job.trimMm }}mm ｜
+          单据指纹：{{ currentFingerprint }}
+        </p>
 
-        <h3>一、板材领料</h3>
+        <div v-if="!feasible" class="void-note">
+          ⚠ 当前选板结论为「{{ job.result?.boardSelect?.status === 'inconclusive' ? '不下结论（零件为空或预算为零）' : '不可行' }}」：
+          {{ job.result?.boardSelect?.gap?.text ?? '板幅/纹理/板种卡点未解（见板件明细页判定步骤）' }}。
+          本页不出板材领料行，不得据此领料。
+        </div>
+
+        <template v-else>
+        <h3>一、板材领料（取选板反算结论，三处同源）</h3>
         <table class="pgrid">
           <thead>
             <tr><th>板材</th><th>规格(mm)</th><th>厚度</th><th>张数</th><th>单价</th><th>小计</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(n, name) in job.result?.boardsByType" :key="name">
-              <td>{{ name }}</td>
-              <td>{{ boardByName(String(name))?.wMm }}×{{ boardByName(String(name))?.hMm }}</td>
-              <td>{{ boardByName(String(name))?.thicknessMm }}</td>
-              <td>{{ n }}</td>
-              <td>{{ money(boardByName(String(name))?.priceCents ?? 0) }}</td>
-              <td>{{ money((boardByName(String(name))?.priceCents ?? 0) * Number(n)) }}</td>
+            <tr v-for="r in orderRows" :key="r.boardId">
+              <td>{{ r.boardName }}{{ r.isOffcut ? '（余料板）' : '' }}</td>
+              <td>{{ r.wMm }}×{{ r.hMm }}</td>
+              <td>{{ r.thicknessMm }}</td>
+              <td>{{ r.sheets }}</td>
+              <td>{{ money(r.priceCents) }}</td>
+              <td>{{ money(r.subtotalCents) }}</td>
             </tr>
           </tbody>
           <tfoot>
             <tr>
-              <td colspan="5">板材合计</td>
-              <td>{{ money(job.result?.totalCostCents ?? 0) }}</td>
+              <td colspan="5">板材合计（分累加，折元四舍五入到分）</td>
+              <td>{{ money(plan?.totalCostCents ?? 0) }}</td>
             </tr>
           </tfoot>
         </table>
@@ -156,7 +187,7 @@ const boardByName = (name: string) =>
           <h4>柜体/房间：{{ cab }}（{{ list.reduce((a, r) => a + r.qty, 0) }} 件）</h4>
           <table class="pgrid">
             <thead>
-              <tr><th>编号</th><th>名称</th><th>尺寸(mm)</th><th>数量</th><th>纹理</th><th>封边</th><th>见光</th></tr>
+              <tr><th>编号</th><th>名称</th><th>尺寸(mm)</th><th>数量</th><th>纹理</th><th>封边</th><th>见光</th><th>领用板种</th></tr>
             </thead>
             <tbody>
               <tr v-for="g in list" :key="g.code">
@@ -167,6 +198,7 @@ const boardByName = (name: string) =>
                 <td>{{ grainText(g.grain) }}</td>
                 <td>{{ g.edgeCount }} 边</td>
                 <td>{{ g.exposed ? '是' : '' }}</td>
+                <td>{{ g.boardName }}</td>
               </tr>
             </tbody>
           </table>
@@ -186,6 +218,7 @@ const boardByName = (name: string) =>
             </tr>
           </tbody>
         </table>
+        </template>
       </section>
     </div>
 
@@ -228,6 +261,14 @@ const boardByName = (name: string) =>
   color: #333;
   margin: 0 0 8px;
   font-size: 11px;
+}
+.void-note {
+  border: 2px solid #b91c1c;
+  color: #b91c1c;
+  padding: 10px 12px;
+  margin: 8px 0;
+  font-weight: 700;
+  font-size: 13px;
 }
 .print-sheet-wrap {
   border: 1px solid #888;

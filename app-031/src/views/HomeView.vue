@@ -168,13 +168,24 @@ function onFile(e: Event): void {
             <span>综合利用率</span>
           </div>
           <div>
-            <b class="save">{{ job.result.savedBoards }}</b>
-            <span>比随手排省（张）</span>
+            <b class="save">{{ money(job.result.totalCostCents) }}</b>
+            <span>
+              板材花费{{
+                job.result.boardSelect && job.result.boardSelect.status !== 'feasible' ? '（未定论）' : ''
+              }}
+            </span>
           </div>
         </div>
         <p v-if="job.result" class="small muted" style="margin: 6px 0 10px">
-          约省 {{ money(job.result.savedCents) }} ｜ 封边
-          {{ (job.result.edgeBandM.exposed + job.result.edgeBandM.normal).toFixed(1) }}m
+          <span v-if="job.result.boardSelect?.status === 'feasible'">
+            {{ job.result.boardSelect.plan?.boardKinds }} 种板 · 预算
+            {{ job.budgetCents < 0 ? '不限' : money(job.budgetCents) }} ·
+            策略 {{ job.boardStrategy === 'cheapest' ? '先最省' : '先板幅最大' }}
+          </span>
+          <span v-else-if="job.result.boardSelect" style="color: var(--c-bad)">
+            选板{{ job.result.boardSelect.status === 'inconclusive' ? '不下结论（零件为空/预算为零）' : '卡点未解，不可领料' }}
+          </span>
+          ｜ 封边 {{ (job.result.edgeBandM.exposed + job.result.edgeBandM.normal).toFixed(1) }}m
         </p>
         <div v-else style="height: 34px"></div>
         <div class="row">

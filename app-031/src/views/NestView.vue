@@ -1,11 +1,20 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import {
+  getJob,
+  runNestWithChange,
+  applyAdjustment,
+  registerOffcuts,
+  useStore,
+  getLastChange
+} from '../lib/store'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
 import { pct, money } from '../lib/format'
 import SheetDiagram from '../components/SheetDiagram.vue'
+import BoardSelectPanel from '../components/BoardSelectPanel.vue'
+import PlanChangePanel from '../components/PlanChangePanel.vue'
 import { cabinetFill, cabinetStroke } from '../lib/colors'
 
 const route = useRoute()
@@ -16,6 +25,11 @@ const activeSheet = ref(0)
 const sheet = computed(() => result.value?.sheets[activeSheet.value])
 const adjustMode = ref(false)
 const selectedId = ref<string | null>(null)
+const changeSeq = ref(0)
+const lastChange = computed(() => {
+  void changeSeq.value
+  return job.value ? getLastChange(job.value.id) : null
+})
 
 const overallUtil = computed(() => {
   if (!result.value || result.value.sheets.length === 0) return 0
@@ -66,9 +80,11 @@ function registerAll(): void {
 
 function rerun(): void {
   if (!job.value) return
-  runNest(job.value)
+  const { change } = runNestWithChange(job.value)
+  changeSeq.value++
   activeSheet.value = 0
-  toast('已重新排样', 'good')
+  if (change?.changed) toast('已按当前锯路/修边/板价同源自重算，变化清单见上', 'good', 3200)
+  else toast('已重新排样（结论与摆法无变化）', 'good')
 }
 
 function onDrop(payload: { instanceId: string; xMm: number; yMm: number }): void {
@@ -142,6 +158,10 @@ function printNest(): void {
 
 <template>
   <div v-if="job && result">
+    <!-- 选板结论（与板件明细页、材料统计页同一份报告） -->
+    <BoardSelectPanel v-if="result.boardSelect" :report="result.boardSelect" compact :show-steps="false" />
+    <PlanChangePanel v-if="lastChange" :change="lastChange" />
+
     <!-- 总览条 -->
     <section class="panel kpi-bar">
       <div><b>{{ result.boardsUsed }}</b><span>板材（张）</span></div>
@@ -187,6 +207,7 @@ function printNest(): void {
           <b>第 {{ activeSheet + 1 }} 张 / 共 {{ result.sheets.length }} 张</b>
           <span class="tag">{{ sheet?.boardName }}</span>
           <span class="tag good">利用率 {{ pct(sheet?.utilization ?? 0) }}</span>
+          <span class="tag">本张板钱 {{ money(sheet?.priceCents ?? 0) }}</span>
           <span v-if="sheet?.adjusted" class="tag warn">已手工微调</span>
           <div class="spacer" />
           <label class="row small" style="gap:4px">

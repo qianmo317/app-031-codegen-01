@@ -1,13 +1,25 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob } from '../lib/store'
+import { getJob, planRows, getLastChange } from '../lib/store'
 import boardsData from '../data/boards.json'
 import { pct, money } from '../lib/format'
+import BoardSelectPanel from '../components/BoardSelectPanel.vue'
+import PlanChangePanel from '../components/PlanChangePanel.vue'
 
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
 const result = computed(() => job.value?.result)
+
+// 领料/成本表唯一取数口：选板 plan（三处同源，不再在本页自行按 boardsByType 拼）
+const rows = computed(() => planRows(result.value))
+const feasible = computed(() => result.value?.boardSelect?.status === 'feasible')
+// 依赖 result 让重算后变化清单刷新（Map 非响应式，经 result.generatedAt 取一次）
+const lastChangeTick = computed(() => result.value?.generatedAt ?? 0)
+const lastChange = computed(() => {
+  void lastChangeTick.value
+  return job.value ? getLastChange(job.value.id) : null
+})
 
 const totalPieces = computed(
   () => result.value?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0
@@ -52,13 +64,23 @@ const utilMinMax = computed(() => {
 
 <template>
   <div v-if="job && result">
+    <!-- 选板结论（与板件明细页、排样结果页同一份报告） -->
+    <BoardSelectPanel v-if="result.boardSelect" :report="result.boardSelect" compact :show-steps="false" />
+    <PlanChangePanel v-if="lastChange" :change="lastChange" />
+
     <!-- 师傅最关心的一句话 -->
     <section class="panel headline">
       <div class="hl-text">
-        <h2>
-          本方案用 <b>{{ result.boardsUsed }}</b> 张板，
-          比随手排省 <b class="hl">{{ result.savedBoards }}</b> 张
-          <span class="hl-money">约 {{ money(result.savedCents) }}</span>
+        <h2 v-if="feasible">
+          本方案买 <b>{{ result.boardSelect?.plan?.boardKinds ?? '—' }}</b> 种板、用
+          <b>{{ result.boardsUsed }}</b> 张，
+          板材花费 <b class="hl">{{ money(result.totalCostCents) }}</b>
+          <span class="hl-save">比随手排省 {{ result.savedBoards }} 张 / 约 {{ money(result.savedCents) }}</span>
+        </h2>
+        <h2 v-else class="hl-blocked">
+          当前没有可领料的选板结论（{{
+            result.boardSelect?.status === 'inconclusive' ? '零件为空或预算为零' : '预算/板幅/纹理卡点'
+          }}），下面的排样仅作试排参考，成本表不出合计
         </h2>
         <p class="muted">
           朴素顺板需要 {{ result.baselineBoards }} 张（原清单顺序、不旋转、货架式摆法）；
@@ -77,24 +99,46 @@ const utilMinMax = computed(() => {
 
     <div class="stat-grid">
       <section class="panel">
-        <h3>板材领料</h3>
+        <h3>板材领料（取选板结论，不另算）</h3>
         <table class="grid">
           <thead>
             <tr><th>板材</th><th>张数</th><th>单价</th><th>小计</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(n, name) in result.boardsByType" :key="name">
-              <td>{{ name }}</td>
-              <td>{{ n }}</td>
-              <td>{{ money(result.sheets.find((x) => x.boardName === name)?.priceCents ?? 0) }}</td>
-              <td>{{ money((result.sheets.find((x) => x.boardName === name)?.priceCents ?? 0) * Number(n)) }}</td>
+            <tr v-for="r in rows" :key="r.boardId">
+              <td>{{ r.boardName }}<span v-if="r.isOffcut" class="tag good">余料</span></td>
+              <td>{{ r.sheets }}</td>
+              <td>{{ money(r.priceCents) }}</td>
+              <td>{{ money(r.subtotalCents) }}</td>
             </tr>
           </tbody>
           <tfoot>
-            <tr><td colspan="3"><b>板材成本合计</b></td><td><b>{{ money(result.totalCostCents) }}</b></td></tr>
+            <tr>
+              <td colspan="3"><b>{{ feasible ? '板材成本合计' : '试排参考合计（不可领料）' }}</b></td>
+              <td :class="{ blockedCost: !feasible }"><b>{{ money(result.totalCostCents) }}</b></td>
+            </tr>
           </tfoot>
         </table>
-        <p class="small muted" style="margin-top: 8px">排样计算耗时 {{ result.elapsedMs }}ms。</p>
+        <p class="small muted" style="margin-top: 8px">
+          金额按分累加、折元四舍五入到分；排样计算耗时 {{ result.elapsedMs }}ms。
+        </p>
+      </section>
+
+      <section class="panel">
+        <h3>每张板摊到的钱（与摆法同一次重算）</h3>
+        <table class="grid">
+          <thead>
+            <tr><th>第几张</th><th>板种</th><th>利用率</th><th>本张板钱</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in result.sheets" :key="s.index">
+              <td>第 {{ s.index + 1 }} 张</td>
+              <td>{{ s.boardName }}</td>
+              <td>{{ pct(s.utilization) }}</td>
+              <td>{{ money(s.priceCents) }}</td>
+            </tr>
+          </tbody>
+        </table>
       </section>
 
       <section class="panel">
@@ -170,10 +214,18 @@ const utilMinMax = computed(() => {
   color: var(--c-primary);
   font-size: 26px;
 }
-.hl-money {
+.hl-save {
   color: var(--c-primary);
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
+  margin-left: 8px;
+}
+.hl-blocked {
+  font-size: 17px;
+  color: var(--c-bad);
+}
+.blockedCost {
+  color: var(--c-bad);
 }
 .alert {
   background: #fffbeb;

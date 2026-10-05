@@ -5,13 +5,17 @@ import {
   useStore,
   getJob,
   saveJob,
-  runNest,
+  runNestWithChange,
+  isResultStale,
+  getLastChange,
   newPart,
   allStockTemplates
 } from '../lib/store'
 import { uid, parsePartText, parseEdges, money } from '../lib/format'
 import { toast } from '../lib/ui'
 import type { Board, EdgeSide, Part } from '../types'
+import BoardSelectPanel from '../components/BoardSelectPanel.vue'
+import PlanChangePanel from '../components/PlanChangePanel.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -23,12 +27,19 @@ const importText = ref('')
 const importErr = ref<string[]>([])
 const importReplace = ref(false)
 const running = ref(false)
+// 最近一次重算的变化清单（与排样结果页、材料统计页取同一份）
+const changeSeq = ref(0)
+const lastChange = computed(() => {
+  void changeSeq.value
+  return job.value ? getLastChange(job.value.id) : null
+})
 
 const grainLabel: Record<Part['grain'], string> = {
   length: '竖纹',
   width: '横纹',
   none: '无要求'
 }
+const thicknessOptions = [0, 9, 18, 25]
 const edgeDefs: { key: EdgeSide; label: string }[] = [
   { key: 'top', label: '上' },
   { key: 'bottom', label: '下' },
@@ -43,8 +54,39 @@ const totalArea = computed(
 
 const availableOffcuts = computed(() => state.offcuts.filter((o) => o.available))
 
+/** 预算元/分双向：内部一律按分（整数）存，输入框按元（2 位小数） */
+const budgetYuan = computed<number | ''>({
+  get: () => {
+    const b = job.value?.budgetCents
+    if (b === undefined || b < 0) return ''
+    return b / 100
+  },
+  set: (v) => {
+    if (!job.value) return
+    if (v === '' || v === null || Number.isNaN(v)) job.value.budgetCents = -1
+    else job.value.budgetCents = Math.round(Number(v) * 100)
+  }
+})
+const stale = computed(() => (job.value ? isResultStale(job.value) : false))
+
 function save(): void {
   if (job.value) saveJob(job.value)
+}
+
+/** 参数/板价变更后：若已有选板结论则立即用同一内核重算，并刷新逐项变化。 */
+async function rerunAfterChange(): Promise<void> {
+  const j = job.value
+  save()
+  if (!j || !j.result || running.value) return
+  running.value = true
+  try {
+    await new Promise((r) => setTimeout(r, 0))
+    const { change } = runNestWithChange(j)
+    changeSeq.value++
+    if (change?.changed) toast('锯路/修边/板价变更：选板结论、每张板的钱与摆法已一起重算', 'good', 3200)
+  } finally {
+    running.value = false
+  }
 }
 
 function addBoard(): void {
@@ -117,18 +159,25 @@ const warnings = computed<string[]>(() => {
   const out: string[] = []
   const j = job.value
   if (!j) return out
-  const maxW = Math.max(...j.boards.map((b) => b.wMm - 2 * j.trimMm))
-  const maxH = Math.max(...j.boards.map((b) => b.hMm - 2 * j.trimMm))
   for (const p of j.parts) {
-    const long = Math.max(p.lenMm, p.widMm)
-    const short = Math.min(p.lenMm, p.widMm)
+    // 板幅预警按该件实际对得上的板来（指定板种/厚度时不能用全库最大板）
+    const allowed = j.boards.filter(
+      (b) =>
+        (!p.boardId || b.id === p.boardId) &&
+        (!(p.thicknessMm && p.thicknessMm > 0) || b.thicknessMm === p.thicknessMm)
+    )
+    if (allowed.length === 0) {
+      out.push(`「${p.code}」指定的板种/厚度在板材库里没有对得上的板`)
+      continue
+    }
+    const maxW = Math.max(...allowed.map((b) => b.wMm - 2 * j.trimMm))
+    const maxH = Math.max(...allowed.map((b) => b.hMm - 2 * j.trimMm))
     if (p.grain === 'length' && (p.lenMm > maxW || p.widMm > maxH))
-      out.push(`「${p.code}」竖纹件 ${p.lenMm}×${p.widMm} 超过可用板幅 ${maxW}×${maxH}`)
+      out.push(`「${p.code}」竖纹件 ${p.lenMm}×${p.widMm} 超过对得上板的可用幅面 ${maxW}×${maxH}`)
     if (p.grain === 'width' && (p.widMm > maxW || p.lenMm > maxH))
-      out.push(`「${p.code}」横纹件 ${p.lenMm}×${p.widMm} 超过可用板幅 ${maxW}×${maxH}`)
-    if (p.grain === 'none' && long > maxW)
-      out.push(`「${p.code}」长边 ${long} 超过板长 ${maxW}`)
-    void short
+      out.push(`「${p.code}」横纹件 ${p.lenMm}×${p.widMm} 超过对得上板的可用幅面 ${maxW}×${maxH}`)
+    if (p.grain === 'none' && Math.max(p.lenMm, p.widMm) > maxW)
+      out.push(`「${p.code}」长边超过对得上板的板长 ${maxW}`)
   }
   if (j.trimMm < 5 || j.trimMm > 10) out.push('修边量通常取 5~10mm')
   return out
@@ -174,11 +223,18 @@ async function doNest(): Promise<void> {
   }
   running.value = true
   try {
-    const r = runNest(j)
-    if (r.unplaced.length > 0) {
-      toast(`${r.unplaced.length} 种零件未排下，请看排样页提示`, 'bad', 4200)
+    const r = runNestWithChange(j)
+    changeSeq.value++
+    const rep = r.result.boardSelect
+    if (rep?.status === 'blocked') {
+      const b0 = rep.blockers.find((x) => x.block === 'budget')
+      toast(b0 ? '排样完成但预算不够，请看选板结论差额' : '有板件排不下，选板结论已标明卡点', 'bad', 4200)
+    } else if (r.result.unplaced.length > 0) {
+      toast(`${r.result.unplaced.length} 种零件未排下，请看排样页提示`, 'bad', 4200)
+    } else if (rep?.status === 'inconclusive') {
+      toast('已试排，但按规则（零件为空/预算为零）不给选板结论', 'info', 3600)
     } else {
-      toast(`排样完成：${r.boardsUsed} 张板，${r.elapsedMs}ms`, 'good')
+      toast(`排样完成：${r.result.boardsUsed} 张板，${r.result.elapsedMs}ms`, 'good')
     }
     router.push(`/nest/${j.id}`)
   } finally {
@@ -207,17 +263,35 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
       <div class="row wrap" style="align-items: flex-end">
         <label class="field" style="width: 130px">
           <span>锯路 kerf (mm)</span>
-          <input v-model.number="job.kerfMm" type="number" step="0.1" min="1" max="8" @change="save" />
+          <input v-model.number="job.kerfMm" type="number" step="0.1" min="1" max="8" @change="rerunAfterChange" />
         </label>
         <label class="field" style="width: 130px">
           <span>四周修边 (mm)</span>
-          <input v-model.number="job.trimMm" type="number" step="1" min="0" max="20" @change="save" />
+          <input v-model.number="job.trimMm" type="number" step="1" min="0" max="20" @change="rerunAfterChange" />
+        </label>
+        <label class="field" style="width: 150px">
+          <span>板材花费上限（元/批，留空=不限；填 0=零预算不下结论）</span>
+          <input v-model.number="budgetYuan" type="number" step="0.01" min="0" placeholder="不限" @change="rerunAfterChange" />
         </label>
         <label class="field row" style="margin-bottom: 10px">
           <input type="checkbox" v-model="job.batchByCabinet" @change="save" />
           <span style="margin: 0 0 0 6px">按柜体批次分组开料（同柜零件尽量连续排）</span>
         </label>
       </div>
+
+      <!-- 选板策略：两条只能选一条，取舍写明 -->
+      <div class="strategy-box">
+        <span class="strategy-title">选板取舍（二选一）：</span>
+        <label class="strategy-opt" :class="{ on: job.boardStrategy === 'cheapest' }">
+          <input type="radio" value="cheapest" v-model="job.boardStrategy" @change="rerunAfterChange" />
+          <span><b>先挑最省的板种</b>：总价最低；常把同样的件摊到更多种板，领料/堆场/点数更费事。</span>
+        </label>
+        <label class="strategy-opt" :class="{ on: job.boardStrategy === 'largest' }">
+          <input type="radio" value="largest" v-model="job.boardStrategy" @change="rerunAfterChange" />
+          <span><b>先挑板幅最大的</b>：张数最少、板种更集中；但大板贵，容易少买几张却顶穿预算。</span>
+        </label>
+      </div>
+
       <div v-if="availableOffcuts.length > 0">
         <h4 style="margin: 8px 0 6px; font-size: 13px">余料优先：勾选已登记余料作为小板材参与本单排样</h4>
         <div class="row wrap">
@@ -233,6 +307,20 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
         </div>
       </div>
     </section>
+
+    <!-- 选板与花费反算（三处同源：结论同时驱动排样结果页、材料统计页与领料单） -->
+    <BoardSelectPanel
+      v-if="job.result?.boardSelect"
+      :report="job.result.boardSelect"
+      :show-steps="true"
+    />
+    <PlanChangePanel v-if="lastChange" :change="lastChange" />
+
+    <div v-if="stale" class="stale-bar">
+      ⚠ 锯路/修边/板价/板件清单相对上一版排样已改动，下列选板结论与排样结果是旧版
+      （明细页不会偷偷挂新板种）——
+      <button class="sm primary" :disabled="running" @click="doNest">立即同源自重算</button>
+    </div>
 
     <!-- 板材库 -->
     <section class="panel" style="margin-bottom: 14px">
@@ -258,11 +346,11 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
               <input v-model="b.name" @change="save" />
               <input v-model="b.material" @change="save" class="sub-input" placeholder="材质" />
             </td>
-            <td style="width: 96px"><input v-model.number="b.wMm" type="number" @change="save" /></td>
-            <td style="width: 96px"><input v-model.number="b.hMm" type="number" @change="save" /></td>
-            <td style="width: 84px"><input v-model.number="b.thicknessMm" type="number" @change="save" /></td>
-            <td style="width: 110px"><input v-model.number="b.priceCents" type="number" @change="save" /></td>
-            <td style="width: 130px"><input v-model.number="b.quantity" type="number" min="0" @change="save" /></td>
+            <td style="width: 96px"><input v-model.number="b.wMm" type="number" @change="rerunAfterChange" /></td>
+            <td style="width: 96px"><input v-model.number="b.hMm" type="number" @change="rerunAfterChange" /></td>
+            <td style="width: 84px"><input v-model.number="b.thicknessMm" type="number" @change="rerunAfterChange" /></td>
+            <td style="width: 110px"><input v-model.number="b.priceCents" type="number" @change="rerunAfterChange" /></td>
+            <td style="width: 130px"><input v-model.number="b.quantity" type="number" min="0" @change="rerunAfterChange" /></td>
             <td style="width: 46px"><button class="sm ghost-danger" @click="removeBoard(b.id)">删</button></td>
           </tr>
         </tbody>
@@ -308,6 +396,7 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
               <th style="width: 80px">宽(mm)</th>
               <th style="width: 64px">数量</th>
               <th style="width: 92px">纹理</th>
+              <th style="width: 92px">指定厚度</th>
               <th style="width: 132px">封边</th>
               <th style="width: 110px">柜体/房间</th>
               <th style="width: 70px">见光</th>
@@ -325,6 +414,12 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
               <td>
                 <select v-model="p.grain" @change="save">
                   <option v-for="(lab, g) in grainLabel" :key="g" :value="g">{{ lab }}</option>
+                </select>
+              </td>
+              <td>
+                <select v-model.number="p.thicknessMm" @change="save">
+                  <option :value="0">不限</option>
+                  <option v-for="t in thicknessOptions.filter((x) => x > 0)" :key="t" :value="t">{{ t }}mm</option>
                 </select>
               </td>
               <td>
@@ -402,6 +497,54 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
   padding: 8px 12px;
   font-size: 12px;
   margin-bottom: 10px;
+}
+.strategy-box {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+  flex-wrap: wrap;
+  margin: 4px 0 10px;
+}
+.strategy-title {
+  font-size: 12.5px;
+  font-weight: 650;
+  align-self: center;
+}
+.strategy-opt {
+  display: flex;
+  gap: 7px;
+  align-items: flex-start;
+  border: 1px solid var(--c-line);
+  border-radius: 8px;
+  padding: 7px 11px;
+  font-size: 12px;
+  color: var(--c-ink-2);
+  cursor: pointer;
+  flex: 1 1 300px;
+  max-width: 520px;
+  background: #fafcf9;
+}
+.strategy-opt input {
+  width: auto;
+  margin-top: 2px;
+}
+.strategy-opt.on {
+  border-color: var(--c-primary);
+  background: #fff7ed;
+  color: var(--c-ink);
+}
+.stale-bar {
+  border: 1px solid #f0d9b5;
+  background: #fffbeb;
+  color: #92600a;
+  border-radius: var(--radius);
+  padding: 8px 14px;
+  font-size: 12.5px;
+  margin-bottom: 12px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
 }
 .table-scroll {
   overflow-x: auto;
